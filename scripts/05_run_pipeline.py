@@ -25,7 +25,7 @@ import logging
 import pickle
 import sys
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 import numpy as np
 import pandas as pd
@@ -58,34 +58,105 @@ except ImportError:
 # Pretty printing
 # ---------------------------------------------------------------------------
 
+def _game_row_cells(gid: str, score: str, meta: pd.DataFrame) -> tuple:
+    """Return display cells for one game row (shared between tables)."""
+    # Convert Series → plain dict so subsequent .get() calls return scalars.
+    row: dict = meta.loc[gid].to_dict() if gid in meta.index else {}
+    try:
+        rating_str = f"{float(row['bayesian_avg']):.1f} ({int(row['review_count'])})"
+    except (KeyError, TypeError, ValueError):
+        rating_str = ""
+    return (
+        score,
+        str(row.get("title", gid)),
+        str(row.get("author", "")),
+        str(row.get("genre", "")),
+        str(row.get("system", "")),
+        str(row.get("tags", "")),
+        rating_str,
+    )
+
+
+def _add_game_columns(table) -> None:
+    """Add standard game columns to a Rich table."""
+    table.add_column("Score",  style="cyan",       width=8)
+    table.add_column("Title",  style="bold white",  min_width=30)
+    table.add_column("Author", style="yellow")
+    table.add_column("Genre",  style="green")
+    table.add_column("System", style="blue")
+    table.add_column("Tags",   style="violet")
+    table.add_column("Rating", style="magenta",    width=12)
+
+
 def print_results(results: List[tuple], game_meta: pd.DataFrame, query: str) -> None:
     """Display top-K results in a readable table."""
     meta = game_meta.set_index("gameid")
 
     if HAS_RICH:
         table = Table(title=f"Results for: [bold]{query}[/bold]", show_lines=True)
-        table.add_column("#",      style="dim", width=4)
-        table.add_column("Score",  style="cyan", width=8)
-        table.add_column("Title",  style="bold white", min_width=30)
-        table.add_column("Author", style="yellow")
-        table.add_column("Genre",  style="green")
+        table.add_column("#", style="dim", width=4)
+        _add_game_columns(table)
         for rank, (gid, score) in enumerate(results, start=1):
-            row = meta.loc[gid] if gid in meta.index else {}
-            table.add_row(
-                str(rank),
-                f"{score:.4f}",
-                str(row.get("title", gid)),
-                str(row.get("author", "")),
-                str(row.get("genre", "")),
-            )
+            table.add_row(str(rank), *_game_row_cells(gid, f"{score:.4f}", meta))
         console.print(table)
     else:
         print(f"\nResults for: {query}")
         print("-" * 80)
         for rank, (gid, score) in enumerate(results, start=1):
-            row = meta.loc[gid] if gid in meta.index else {}
+            row: dict = meta.loc[gid].to_dict() if gid in meta.index else {}
+            try:
+                rating_str = f"  ★{float(row['bayesian_avg']):.1f}"
+            except (KeyError, TypeError, ValueError):
+                rating_str = ""
             print(f"  {rank:2d}. [{score:.4f}] {row.get('title', gid)} "
-                  f"({row.get('author','')}) — {row.get('genre','')}")
+                  f"({row.get('author','')}) — {row.get('genre','')}{rating_str}")
+        print()
+
+
+def print_game_summary(gid: str, game_meta: pd.DataFrame, label: str = "Game") -> None:
+    """Print a single game's metadata in the standard table format."""
+    meta = game_meta.set_index("gameid")
+    if HAS_RICH:
+        table = Table(title=f"[bold]{label}[/bold]", show_lines=True)
+        _add_game_columns(table)
+        table.add_row(*_game_row_cells(gid, "–", meta))
+        console.print(table)
+    else:
+        row: dict = meta.loc[gid].to_dict() if gid in meta.index else {}
+        try:
+            rating_str = f"  ★{float(row['bayesian_avg']):.1f}"
+        except (KeyError, TypeError, ValueError):
+            rating_str = ""
+        print(f"\n{label}: {row.get('title', gid)} "
+              f"({row.get('author','')}) — {row.get('genre','')}{rating_str}")
+        print()
+
+
+def print_user_profile(userid: str, profile_text: str) -> None:
+    """Print a user's taste profile in a readable format."""
+    # profile_text: "A player who enjoys: Genre: X; System: Y; Tags: a, b, c"
+    if HAS_RICH:
+        from rich.panel import Panel
+        from rich.text import Text
+        lines = Text()
+        lines.append(f"User: {userid}\n", style="bold cyan")
+        prefix = "A player who enjoys: "
+        body = profile_text[len(prefix):] if profile_text.startswith(prefix) else profile_text
+        for part in body.split("; "):
+            if ": " in part:
+                key, val = part.split(": ", 1)
+                lines.append(f"  {key}: ", style="bold yellow")
+                lines.append(f"{val}\n")
+            else:
+                lines.append(f"  {part}\n")
+        console.print(Panel(lines, title="User Profile", border_style="cyan"))
+    else:
+        print(f"\nUser profile — {userid}")
+        print("-" * 60)
+        prefix = "A player who enjoys: "
+        body = profile_text[len(prefix):] if profile_text.startswith(prefix) else profile_text
+        for part in body.split("; "):
+            print(f"  {part}")
         print()
 
 
@@ -115,20 +186,17 @@ def load_artefacts(cfg: dict):
     game_docs     = pd.read_parquet(data_dir / "game_docs.parquet")
     user_profiles = pd.read_parquet(data_dir / "user_profiles.parquet")
 
-    doc_map     = dict(zip(game_docs["gameid"],    game_docs["doc_text"]))
+    doc_map     = dict(zip(game_docs["gameid"],     game_docs["doc_text"]))
     profile_map = dict(zip(user_profiles["userid"], user_profiles["profile_text"]))
 
-    # Wrap in our Retriever
     retriever = Retriever(
-        model=None,  # we'll call bi_encoder directly below (simpler for demo)
+        model=None,
         index=index,
         user_profiles=profile_map,
         game_embeddings=game_embeddings,
     )
-    # Patch the raw SentenceTransformer encode into the retriever's model object
     retriever.bi_encoder = bi_encoder
 
-    # Cross-encoder reranker
     logger.info("Loading cross-encoder: %s …", cfg["model"]["reranker_model"])
     reranker = Reranker(model_name=cfg["model"]["reranker_model"])
 
@@ -155,6 +223,8 @@ def run_interactive(
     print(f"  Retrieve top: {top_k_ret}  Rerank top: {top_k_rank}")
     print("  Type 'quit' to exit.\n")
 
+    game_meta = game_docs.set_index("gameid")
+
     while True:
         try:
             query = input("Query > ").strip()
@@ -165,22 +235,32 @@ def run_interactive(
         if not query:
             continue
 
-        # Encode query
         if query_type == "userid":
-            profile = profile_map.get(query)
-            if not profile:
-                print(f"  ⚠ No profile found for user '{query}'")
+            emb = retriever._encode_userid(query)
+            if emb is None:
+                print(f"  No profile found for user '{query}'")
                 continue
-            query_text = profile
-        else:
+            profile_text = profile_map.get(query, "")
+            print_user_profile(query, profile_text)
+            query_text = profile_text
+
+        elif query_type == "game_id":
+            if query not in game_meta.index:
+                print(f"  Game ID '{query}' not found in index")
+                continue
+            print_game_summary(query, game_docs, label="Input game")
+            emb = retriever._encode_game_ids([query])
+            if emb is None:
+                print(f"  Could not encode game '{query}'")
+                continue
+            query_text = doc_map.get(query, query)
+
+        else:  # text
+            emb = bi_encoder.encode([query], normalize_embeddings=True)[0]
             query_text = query
 
-        emb = bi_encoder.encode([query_text], normalize_embeddings=True)[0]
-
-        # Retrieve
         candidates = retriever.index.search(emb, top_k=top_k_ret)
 
-        # Rerank
         results = reranker.rerank(
             query_text=query_text,
             candidates=candidates,
@@ -196,8 +276,8 @@ def run_interactive(
 # ---------------------------------------------------------------------------
 
 def run_evaluation(
-    retriever, bi_encoder,
-    game_docs, doc_map, profile_map,
+    retriever,
+    game_docs, doc_map,
     cfg,
 ) -> None:
     data_dir   = Path(cfg["paths"]["data_dir"])
@@ -210,23 +290,24 @@ def run_evaluation(
         (interactions["split"] == "test") & (interactions["label"] == 1)
     ]
 
-    # Ground truth: {userid → {gameid, …}}
     ground_truth: Dict[str, set] = (
         test_pos.groupby("userid")["gameid"].apply(set).to_dict()
     )
 
-    # Build predictions for each test user
     logger.info("Running retrieval for %d test users …", len(ground_truth))
     predictions: Dict[str, List[str]] = {}
+    n_skipped = 0
     for uid in ground_truth:
-        profile = profile_map.get(uid)
-        if not profile:
+        emb = retriever._encode_userid(uid)
+        if emb is None:
+            n_skipped += 1
             continue
-        emb = bi_encoder.encode([profile], normalize_embeddings=True)[0]
         candidates = retriever.index.search(emb, top_k=top_k_ret)
         predictions[uid] = [gid for gid, _ in candidates]
 
-    # Metrics
+    if n_skipped:
+        logger.warning("%d test users had no profile and were skipped", n_skipped)
+
     results = evaluate_retrieval(
         predictions=predictions,
         ground_truth=ground_truth,
@@ -251,7 +332,7 @@ def main() -> None:
     parser.add_argument("--mode",       default="interactive",
                         choices=["interactive", "evaluate"])
     parser.add_argument("--query-type", default="text",
-                        choices=["text", "userid", "game_ids"])
+                        choices=["text", "userid", "game_id"])
     args = parser.parse_args()
 
     with open(args.config) as f:
@@ -267,7 +348,7 @@ def main() -> None:
             cfg, query_type=args.query_type,
         )
     else:
-        run_evaluation(retriever, bi_encoder, game_docs, doc_map, profile_map, cfg)
+        run_evaluation(retriever, game_docs, doc_map, cfg)
 
 
 if __name__ == "__main__":

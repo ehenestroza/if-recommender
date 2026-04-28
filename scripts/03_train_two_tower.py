@@ -36,8 +36,9 @@ from pathlib import Path
 import pandas as pd
 import torch
 import yaml
-from sentence_transformers import SentenceTransformer, InputExample, losses
-from sentence_transformers.evaluation import InformationRetrievalEvaluator
+from sentence_transformers import SentenceTransformer, InputExample
+from sentence_transformers.sentence_transformer.losses import MultipleNegativesRankingLoss
+from sentence_transformers.sentence_transformer.evaluation import InformationRetrievalEvaluator
 from torch.utils.data import DataLoader
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -72,7 +73,7 @@ def build_ir_evaluator(
     user_profiles: pd.DataFrame,
     game_docs: pd.DataFrame,
     name: str = "val",
-) -> InformationRetrievalEvaluator:
+) -> InformationRetrievalEvaluator | None:
     """
     Build an InformationRetrievalEvaluator from validation positives.
 
@@ -99,6 +100,13 @@ def build_ir_evaluator(
     logger.info(
         "IR evaluator: %d queries, %d corpus items", len(queries), len(corpus)
     )
+    if not queries:
+        logger.warning(
+            "No val users have pre-built profiles (profiles are derived from "
+            "training positives only). Skipping IR evaluator."
+        )
+        return None
+
     return InformationRetrievalEvaluator(
         queries=queries,
         corpus=corpus,
@@ -117,8 +125,10 @@ def main() -> None:
     parser.add_argument("--config",     default="config.yaml")
     parser.add_argument("--epochs",     type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
-    parser.add_argument("--no-eval",    action="store_true",
+    parser.add_argument("--no-eval",      action="store_true",
                         help="Skip IR evaluation (faster, useful for debugging)")
+    parser.add_argument("--sample-frac", type=float, default=None,
+                        help="Use a random fraction of training pairs, e.g. 0.05 for 5%%")
     args = parser.parse_args()
 
     with open(args.config) as f:
@@ -148,6 +158,11 @@ def main() -> None:
     # ------------------------------------------------------------------ #
     logger.info("Building pair dataset …")
     pair_ds = PairDataset(train_ixns, user_profiles, game_docs)
+    if args.sample_frac is not None:
+        import random
+        k = max(1, int(len(pair_ds.pairs) * args.sample_frac))
+        pair_ds.pairs = random.sample(pair_ds.pairs, k)
+        logger.info("Sampled %.1f%% → %d pairs", args.sample_frac * 100, k)
     st_ds   = STInputExampleDataset(pair_ds)
     logger.info("Training pairs: %d", len(st_ds))
 
@@ -165,7 +180,7 @@ def main() -> None:
     model = SentenceTransformer(model_cfg["base_model"])
     model.max_seq_length = model_cfg["max_seq_length"]
 
-    loss_fn = losses.MultipleNegativesRankingLoss(model)
+    loss_fn = MultipleNegativesRankingLoss(model)
 
     # ------------------------------------------------------------------ #
     # Evaluator
@@ -197,8 +212,8 @@ def main() -> None:
         optimizer_params={"lr": tr_cfg["learning_rate"]},
         output_path=str(model_out),
         show_progress_bar=True,
-        evaluation_steps=steps_per_epoch,  # evaluate once per epoch
-        save_best_model=True,
+        evaluation_steps=steps_per_epoch if evaluator is not None else 0,
+        save_best_model=evaluator is not None,
     )
 
     logger.info("✓ Training complete. Model saved to %s", model_out)

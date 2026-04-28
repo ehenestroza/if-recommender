@@ -17,7 +17,7 @@ class Retriever:
 
     Supports three query modes:
       text     – encode a free-text string directly
-      userid   – look up the user's pre-built profile text, then encode
+      userid   – encode the user's pre-built profile text
       game_ids – average the embeddings of seed games ("more like these")
     """
 
@@ -28,7 +28,7 @@ class Retriever:
         user_profiles: Dict[str, str],
         game_embeddings: Dict[str, np.ndarray],
     ) -> None:
-        self.bi_encoder = model          # may be patched after construction
+        self.bi_encoder = model
         self.index = index
         self.user_profiles = user_profiles
         self.game_embeddings = game_embeddings

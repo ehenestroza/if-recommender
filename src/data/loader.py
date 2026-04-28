@@ -11,11 +11,9 @@ logger = logging.getLogger(__name__)
 
 # MySQL table name → parquet filename
 TABLES: dict[str, str] = {
-    "games":       "games.parquet",
-    "reviews":     "reviews.parquet",
-    "gametags":    "gametags.parquet",
-    "wishlists":   "wishlists.parquet",
-    "playedgames": "playedgames.parquet",
+    "games":   "games.parquet",
+    "reviews": "reviews.parquet",
+    "users":   "users.parquet",
 }
 
 # IFDB uses "ifid" as the game primary key in some dumps; normalise to "gameid".
@@ -31,6 +29,16 @@ def _normalise_game_id(df: pd.DataFrame) -> pd.DataFrame:
             df = df.rename(columns={alias: "gameid"})
             logger.debug("Renamed column '%s' → 'gameid'", alias)
             return df
+    return df
+
+
+def _normalise_user_id(df: pd.DataFrame) -> pd.DataFrame:
+    """Rename the user primary-key column to 'userid' if it isn't already."""
+    if "userid" in df.columns:
+        return df
+    if "id" in df.columns:
+        df = df.rename(columns={"id": "userid"})
+        logger.debug("Renamed column 'id' → 'userid'")
     return df
 
 
@@ -65,7 +73,10 @@ def extract_table(
         logger.warning("  Could not fetch '%s': %s", table, exc)
         return
 
-    df = _normalise_game_id(df)
+    if table == "users":
+        df = _normalise_user_id(df)
+    else:
+        df = _normalise_game_id(df)
     df = _coerce_object_columns(df)
     dest.parent.mkdir(parents=True, exist_ok=True)
     df.to_parquet(dest, index=False)

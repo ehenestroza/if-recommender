@@ -6,14 +6,14 @@ What this script does
 ---------------------
 1. Loads raw tables from data/
 2. Builds game document strings (item-tower inputs)
-3. Assembles interaction matrix from all signals and splits train/val/test
-4. Builds user profile strings (query-tower inputs)
+3. Assembles interaction matrix from review ratings and splits train/val/test
+4. Builds user profile strings and review text lists (query-tower inputs)
 5. Saves processed artefacts to data/
 
 After this step data/ will contain:
-  game_docs.parquet     – gameid, title, author, genre, doc_text
+  game_docs.parquet     – gameid, title, author, genre, system, tags, avg_rating, bayesian_avg, review_count, doc_text
   interactions.parquet  – all interactions with label + split column
-  user_profiles.parquet – userid, profile_text
+  user_profiles.parquet – userid, profile_text, review_texts
 
 Usage
 -----
@@ -50,33 +50,42 @@ def main() -> None:
 
     data_dir = Path(cfg["paths"]["data_dir"])
     tr_cfg   = cfg["training"]
+    pp_cfg   = cfg.get("preprocessing", {})
 
     # ------------------------------------------------------------------ #
     # 1. Load raw tables
     # ------------------------------------------------------------------ #
     logger.info("Loading raw tables …")
-    games        = load_parquet(data_dir, "games.parquet")
-    reviews      = load_parquet(data_dir, "reviews.parquet")
-    gametags     = load_parquet(data_dir, "gametags.parquet")
-    wishlists    = load_parquet(data_dir, "wishlists.parquet")
-    playedgames  = load_parquet(data_dir, "playedgames.parquet")
-
-    logger.info(
-        "Loaded: games=%d, reviews=%d, gametags=%d, wishlists=%d, playedgames=%d",
-        len(games), len(reviews), len(gametags), len(wishlists), len(playedgames),
-    )
+    games   = load_parquet(data_dir, "games.parquet")
+    reviews = load_parquet(data_dir, "reviews.parquet")
+    users   = load_parquet(data_dir, "users.parquet")
+    logger.info("Loaded: games=%d, reviews=%d, users=%d", len(games), len(reviews), len(users))
 
     # ------------------------------------------------------------------ #
     # 2. Game documents
     # ------------------------------------------------------------------ #
     logger.info("Building game documents …")
-    game_docs = build_game_documents(games, gametags)
+    game_docs = build_game_documents(
+        games=games,
+        reviews=reviews,
+        min_reviews=tr_cfg["min_reviews_per_game"],
+        bayesian_prior_mean=pp_cfg.get("bayesian_prior_mean", 3.5),
+        bayesian_prior_weight=pp_cfg.get("bayesian_prior_weight", 10),
+    )
     game_docs.to_parquet(data_dir / "game_docs.parquet", index=False)
     logger.info("Saved game_docs.parquet (%d games)", len(game_docs))
 
-    # Sample a few for inspection
-    for _, row in game_docs.head(3).iterrows():
-        logger.info("  [%s] %s\n      → %s…", row["gameid"], row["title"], row["doc_text"][:120])
+    sample_1 = game_docs.iloc[0]
+    logger.info(
+        "Sample game document:\n  gameid=%s\n  doc_text=%s",
+        sample_1["gameid"], sample_1["doc_text"],
+    )
+
+    sample_2 = game_docs.iloc[1]
+    logger.info(
+        "Sample game document:\n  gameid=%s\n  doc_text=%s",
+        sample_2["gameid"], sample_2["doc_text"],
+    )
 
     # ------------------------------------------------------------------ #
     # 3. Interactions + split
@@ -84,12 +93,23 @@ def main() -> None:
     logger.info("Building interaction matrix …")
     interactions = build_interactions(
         reviews=reviews,
-        wishlists=wishlists,
-        playedgames=playedgames,
+        users=users,
         min_rating_positive=tr_cfg["min_rating_positive"],
         max_rating_negative=tr_cfg["max_rating_negative"],
         min_reviews_per_user=tr_cfg["min_reviews_per_user"],
         min_reviews_per_game=tr_cfg["min_reviews_per_game"],
+    )
+    logger.info(
+        "Interactions: %d total  (%d positive, %d negative)",
+        len(interactions),
+        (interactions["label"] == 1).sum(),
+        (interactions["label"] == 0).sum(),
+    )
+
+    sample_ix = interactions.iloc[0]
+    logger.info(
+        "Sample interaction: userid=%s | gameid=%s | label=%d",
+        sample_ix["userid"], sample_ix["gameid"], int(sample_ix["label"]),
     )
 
     train, val, test = split_interactions(
@@ -98,7 +118,6 @@ def main() -> None:
         test_frac=tr_cfg["test_frac"],
     )
 
-    # Add split label and save as one file for convenience
     train["split"] = "train"
     val["split"]   = "val"
     test["split"]  = "test"
@@ -113,11 +132,21 @@ def main() -> None:
     user_profiles = build_user_profiles(
         interactions=train,
         game_docs=game_docs,
-        gametags=gametags,
-        min_rating_positive=tr_cfg["min_rating_positive"],
     )
     user_profiles.to_parquet(data_dir / "user_profiles.parquet", index=False)
     logger.info("Saved user_profiles.parquet (%d users)", len(user_profiles))
+
+    sample_profile_1 = user_profiles.iloc[0]
+    logger.info(
+        "Sample user profile 1:\n  userid=%s\n  profile_text=%s",
+        sample_profile_1["userid"], sample_profile_1["profile_text"],
+    )
+
+    sample_profile_2 = user_profiles.iloc[1]
+    logger.info(
+        "Sample user profile 2:\n  userid=%s\n  profile_text=%s",
+        sample_profile_2["userid"], sample_profile_2["profile_text"],
+    )
 
     # ------------------------------------------------------------------ #
     # Summary
