@@ -92,6 +92,10 @@ if-recommender/
 ├── config.yaml                   # All tunable parameters
 ├── pyproject.toml / uv.lock
 │
+├── data/                         # Preprocessed Parquet files
+├── models/                       # Fine-tuned model weights: query_encoder, doc_encoder, reranker
+├── outputs/                      # FAISS index, embedding arrays, and ID maps
+│
 ├── src/
 │   ├── db/
 │   │   └── connector.py          # SQLAlchemy MySQL connection
