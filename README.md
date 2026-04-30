@@ -99,8 +99,6 @@ if-recommender/
 │   │   ├── loader.py             # MySQL → Parquet extraction
 │   │   ├── preprocessor.py       # Game docs, user profiles, interactions, splits
 │   │   └── dataset.py            # PairDataset for bi-encoder training
-│   ├── models/
-│   │   └── two_tower.py          # TwoTowerModel wrapper
 │   ├── index/
 │   │   └── faiss_index.py        # GameIndex: build / search / save / load
 │   ├── pipeline/

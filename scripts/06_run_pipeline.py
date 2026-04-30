@@ -266,11 +266,7 @@ def load_artefacts(cfg: dict):
     index_dir = Path(cfg["paths"]["index_dir"])
     retr_cfg  = cfg.get("retrieval", {})
 
-    # Prefer asymmetric query_encoder; fall back to legacy two_tower
-    if (base_dir / "query_encoder").exists():
-        encoder_dir = base_dir / "query_encoder"
-    else:
-        encoder_dir = base_dir / "two_tower"
+    encoder_dir = base_dir / "query_encoder"
     logger.info("Loading query encoder from %s …", encoder_dir)
     query_encoder = SentenceTransformer(str(encoder_dir))
     query_encoder.max_seq_length = cfg["model"]["max_seq_length"]
@@ -391,7 +387,7 @@ def run_interactive(
         game_query_text_map = doc_map
 
     print("\n" + "=" * 60)
-    print("  IFDB Two-Tower Retrieval Demo")
+    print("  IFDB Retrieval Demo")
     print("=" * 60)
     print(f"  Query type       : {query_type}")
     print(f"  Score threshold  : {min_score}  Reranker input: {top_k_ret}  Output: {top_k_rank}")

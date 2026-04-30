@@ -4,7 +4,7 @@ Step 5 – Encode all games and build the FAISS retrieval index.
 
 What this does
 --------------
-1. Loads the doc encoder from models/doc_encoder/ (falls back to models/two_tower/)
+1. Loads the doc encoder from models/doc_encoder/
 2. Encodes all game documents → normalised float32 embeddings
 3. Saves embeddings as a numpy array (for "more like these" queries)
 4. Builds a FAISS index (flat or HNSW per config) and saves it to outputs/
@@ -49,7 +49,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config",    default="config.yaml")
     parser.add_argument("--model-dir", default=None,
-                        help="Override model directory (default: config paths.model_dir/two_tower)")
+                        help="Override model directory (default: config paths.model_dir/doc_encoder)")
     args = parser.parse_args()
 
     with open(args.config) as f:
@@ -58,14 +58,11 @@ def main() -> None:
     data_dir  = Path(cfg["paths"]["data_dir"])
     index_dir = Path(cfg["paths"]["index_dir"])
 
-    # Prefer the asymmetric doc_encoder; fall back to legacy two_tower
     base_model_dir = Path(cfg["paths"]["model_dir"])
     if args.model_dir:
         model_dir = Path(args.model_dir)
-    elif (base_model_dir / "doc_encoder").exists():
-        model_dir = base_model_dir / "doc_encoder"
     else:
-        model_dir = base_model_dir / "two_tower"
+        model_dir = base_model_dir / "doc_encoder"
     model_cfg  = cfg["model"]
     retr_cfg   = cfg["retrieval"]
 
