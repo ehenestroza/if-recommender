@@ -12,18 +12,18 @@ database:
 
 model:
   base_model: "sentence-transformers/all-MiniLM-L6-v2"
-  reranker_model: "cross-encoder/ms-marco-MiniLM-L-6-v2"
+  reranker_model: "cross-encoder/ms-marco-MiniLM-L6-v2"
   max_seq_length: 256
 
 preprocessing:
   bayesian_prior_mean: 3.5    # assumed rating for a game with no reviews
-  bayesian_prior_weight: 5   # shrinks toward prior until this many real reviews
+  bayesian_prior_weight: 5    # shrinks toward prior until this many real reviews
+  rating_deviation_threshold: 0.25  # positive if rating > bayesian_avg + threshold
 
 training:
   epochs: 3
   batch_size: 64
-  min_rating_positive: 4      # reviews >= 4 stars are positive
-  max_rating_negative: 3      # reviews <= 3 stars are negative
+  temperature: 0.07           # InfoNCE softmax temperature
   min_reviews_per_user: 2     # drop users with fewer interactions
   min_reviews_per_game: 2     # drop games with fewer interactions
   val_frac: 0.1
@@ -31,8 +31,18 @@ training:
   learning_rate: 2.0e-5
   warmup_ratio: 0.1
 
+reranker_training:
+  epochs: 2
+  batch_size: 16
+  learning_rate: 2.0e-5
+
 retrieval:
-  top_k_retrieve: 100
-  top_k_rerank: 10
+  min_retrieval_score: 0.25   # drop candidates with cosine similarity below this
+  min_rerank_score: 0.5       # drop reranked candidates with cross-encoder sigmoid score below this
+  top_k_retrieve: 50          # max candidates passed to the reranker after hard filtering
+  top_k_rerank: 25
   index_type: "flat"          # "hnsw" for faster approximate search at scale
   hnsw_m: 32
+  use_rating_reranking: true  # blend normalised bayesian_avg into rerank score
+  rating_weight: 0.5          # weight given to bayesian_avg when blending
+  use_diversity: true         # post-rerank step to cover all target genres/systems

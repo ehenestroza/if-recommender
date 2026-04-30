@@ -5,15 +5,13 @@ Step 2 – Prepare training data from raw Parquet files.
 What this script does
 ---------------------
 1. Loads raw tables from data/
-2. Builds game document strings (item-tower inputs)
+2. Builds two game document sets:
+     game_docs.parquet           – strict set (≥ min_reviews_per_game) for training
+     game_docs_retrieval.parquet – broad set (all valid games, even 0 reviews) for indexing
 3. Assembles interaction matrix from review ratings and splits train/val/test
-4. Builds user profile strings and review text lists (query-tower inputs)
-5. Saves processed artefacts to data/
-
-After this step data/ will contain:
-  game_docs.parquet     – gameid, title, author, genre, system, tags, avg_rating, bayesian_avg, review_count, doc_text
-  interactions.parquet  – all interactions with label + split column
-  user_profiles.parquet – userid, profile_text, review_texts
+4. Builds two user profile sets:
+     user_profiles.parquet           – training-set positives only
+     user_profiles_retrieval.parquet – all users with ≥1 positive interaction
 
 Usage
 -----
@@ -29,6 +27,9 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from src.utils.env import configure_logging
+configure_logging()
+
 from src.data.loader import load_parquet
 from src.data.preprocessor import (
     build_game_documents,
@@ -37,10 +38,6 @@ from src.data.preprocessor import (
     build_user_profiles,
 )
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s – %(message)s",
-)
 logger = logging.getLogger(__name__)
 
 
@@ -62,9 +59,10 @@ def main() -> None:
     logger.info("Loaded: games=%d, reviews=%d, users=%d", len(games), len(reviews), len(users))
 
     # ------------------------------------------------------------------ #
-    # 2. Game documents
+    # 2a. Strict game docs (for training interactions)
     # ------------------------------------------------------------------ #
-    logger.info("Building game documents …")
+    logger.info("Building strict game documents (min_reviews=%d) …",
+                tr_cfg["min_reviews_per_game"])
     game_docs = build_game_documents(
         games=games,
         reviews=reviews,
@@ -80,7 +78,6 @@ def main() -> None:
         "Sample game document:\n  gameid=%s\n  doc_text=%s",
         sample_1["gameid"], sample_1["doc_text"],
     )
-
     sample_2 = game_docs.iloc[1]
     logger.info(
         "Sample game document:\n  gameid=%s\n  doc_text=%s",
@@ -88,14 +85,29 @@ def main() -> None:
     )
 
     # ------------------------------------------------------------------ #
-    # 3. Interactions + split
+    # 2b. Broad game docs (for retrieval index — includes 0-review games)
     # ------------------------------------------------------------------ #
-    logger.info("Building interaction matrix …")
+    logger.info("Building broad game documents (min_reviews=0) …")
+    game_docs_retrieval = build_game_documents(
+        games=games,
+        reviews=reviews,
+        min_reviews=0,
+        bayesian_prior_mean=pp_cfg.get("bayesian_prior_mean", 3.5),
+        bayesian_prior_weight=pp_cfg.get("bayesian_prior_weight", 10),
+    )
+    game_docs_retrieval.to_parquet(data_dir / "game_docs_retrieval.parquet", index=False)
+    logger.info("Saved game_docs_retrieval.parquet (%d games)", len(game_docs_retrieval))
+
+    # ------------------------------------------------------------------ #
+    # 3. Interactions + split  (uses strict game_docs for bayesian_avg)
+    # ------------------------------------------------------------------ #
+    threshold = pp_cfg.get("rating_deviation_threshold", 0.25)
+    logger.info("Building interaction matrix (threshold=±%.2f) …", threshold)
     interactions = build_interactions(
         reviews=reviews,
         users=users,
-        min_rating_positive=tr_cfg["min_rating_positive"],
-        max_rating_negative=tr_cfg["max_rating_negative"],
+        game_docs=game_docs,
+        rating_deviation_threshold=threshold,
         min_reviews_per_user=tr_cfg["min_reviews_per_user"],
         min_reviews_per_game=tr_cfg["min_reviews_per_game"],
     )
@@ -104,12 +116,6 @@ def main() -> None:
         len(interactions),
         (interactions["label"] == 1).sum(),
         (interactions["label"] == 0).sum(),
-    )
-
-    sample_ix = interactions.iloc[0]
-    logger.info(
-        "Sample interaction: userid=%s | gameid=%s | label=%d",
-        sample_ix["userid"], sample_ix["gameid"], int(sample_ix["label"]),
     )
 
     train, val, test = split_interactions(
@@ -126,26 +132,57 @@ def main() -> None:
     logger.info("Saved interactions.parquet (%d rows total)", len(all_splits))
 
     # ------------------------------------------------------------------ #
-    # 4. User profiles  (built from training-set positives only)
+    # 4a. Training user profiles  (training-set positives only)
     # ------------------------------------------------------------------ #
-    logger.info("Building user profiles from training positives …")
+    logger.info("Building training user profiles …")
     user_profiles = build_user_profiles(
         interactions=train,
         game_docs=game_docs,
+        reviews=reviews,
+        users=users,
     )
     user_profiles.to_parquet(data_dir / "user_profiles.parquet", index=False)
     logger.info("Saved user_profiles.parquet (%d users)", len(user_profiles))
 
     sample_profile_1 = user_profiles.iloc[0]
     logger.info(
-        "Sample user profile 1:\n  userid=%s\n  profile_text=%s",
-        sample_profile_1["userid"], sample_profile_1["profile_text"],
+        "Sample user profile 1:\n  userid=%s  name=%s\n  profile_text=%s",
+        sample_profile_1["userid"], sample_profile_1.get("name", ""),
+        sample_profile_1["profile_text"],
     )
-
     sample_profile_2 = user_profiles.iloc[1]
     logger.info(
-        "Sample user profile 2:\n  userid=%s\n  profile_text=%s",
-        sample_profile_2["userid"], sample_profile_2["profile_text"],
+        "Sample user profile 2:\n  userid=%s  name=%s\n  profile_text=%s",
+        sample_profile_2["userid"], sample_profile_2.get("name", ""),
+        sample_profile_2["profile_text"],
+    )
+
+    # ------------------------------------------------------------------ #
+    # 4b. Retrieval user profiles  (all users with ≥1 positive interaction)
+    # ------------------------------------------------------------------ #
+    logger.info("Building retrieval user profiles (all users with ≥1 positive) …")
+    all_interactions = build_interactions(
+        reviews=reviews,
+        users=users,
+        game_docs=game_docs_retrieval,
+        rating_deviation_threshold=threshold,
+        min_reviews_per_user=1,
+        min_reviews_per_game=1,
+    )
+    all_positives = all_interactions[all_interactions["label"] == 1][
+        ["userid", "gameid", "label"]
+    ].copy()
+    user_profiles_retrieval = build_user_profiles(
+        interactions=all_positives,
+        game_docs=game_docs_retrieval,
+        reviews=reviews,
+        users=users,
+    )
+    user_profiles_retrieval.to_parquet(
+        data_dir / "user_profiles_retrieval.parquet", index=False
+    )
+    logger.info(
+        "Saved user_profiles_retrieval.parquet (%d users)", len(user_profiles_retrieval)
     )
 
     # ------------------------------------------------------------------ #

@@ -3,7 +3,7 @@
 import logging
 import pickle
 from pathlib import Path
-from typing import List, Tuple, Union
+from typing import List, Optional, Tuple, Union
 
 import faiss
 import numpy as np
@@ -59,16 +59,27 @@ class GameIndex:
     # ------------------------------------------------------------------
 
     def search(
-        self, query_emb: np.ndarray, top_k: int = 100
+        self,
+        query_emb: np.ndarray,
+        top_k: int = 100,
+        min_score: Optional[float] = None,
     ) -> List[Tuple[str, float]]:
+        """Return (gameid, score) pairs.
+
+        When min_score is set, searches the entire index and returns all
+        candidates with cosine similarity >= min_score (top_k is ignored).
+        When min_score is None, returns the top_k nearest neighbours.
+        """
         if self._index is None:
             raise RuntimeError("Index not built. Call build() or load() first.")
         q = np.asarray(query_emb, dtype=np.float32).reshape(1, -1)
-        scores, indices = self._index.search(q, top_k)
+        k = self._index.ntotal if min_score is not None else top_k
+        scores, indices = self._index.search(q, k)
         results = []
         for idx, score in zip(indices[0], scores[0]):
             if 0 <= idx < len(self.game_ids):
-                results.append((self.game_ids[idx], float(score)))
+                if min_score is None or score >= min_score:
+                    results.append((self.game_ids[idx], float(score)))
         return results
 
     # ------------------------------------------------------------------

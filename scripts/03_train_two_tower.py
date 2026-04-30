@@ -1,27 +1,17 @@
 #!/usr/bin/env python
 """
-Step 3 – Fine-tune the two-tower bi-encoder.
+Step 3 – Fine-tune the asymmetric two-tower bi-encoder.
 
-Training setup
---------------
-Loss      : MultipleNegativesRankingLoss (in-batch negatives, symmetric InfoNCE)
-Data      : (user_profile_text, positive_game_doc) pairs from training-split positives
-Backbone  : sentence-transformers/all-MiniLM-L6-v2  (configurable)
-Optimiser : AdamW with linear warmup + cosine decay  (handled by ST Trainer)
+Two separate SentenceTransformer models are trained with distinct weights:
+  query_encoder  →  encodes user profile text
+  doc_encoder    →  encodes game document text
 
-The fine-tuned model is saved to models/two_tower/.
+Training uses symmetric InfoNCE loss: each (query_i, doc_i) pair treats
+{doc_j | j≠i} as negatives for query_i and {query_j | j≠i} as negatives
+for doc_i. Both encoders are updated jointly via a shared AdamW optimizer
+with linear warmup.
 
-Why MultipleNegativesRankingLoss?
-----------------------------------
-Each positive pair (a_i, p_i) in a batch of size B also sees B-1 other
-positives {p_j | j≠i} as *in-batch negatives*.  The loss is:
-
-    L = -log [ exp(sim(a_i, p_i) / τ) /
-               Σ_{j=1..B} exp(sim(a_i, p_j) / τ) ]
-
-This scales well, requires no explicit negative mining, and matches DPR /
-SimCSE / E5 training paradigms — all of which are directly relevant to
-the Hugging Face ecosystem signal we're building toward.
+Outputs: models/query_encoder/, models/doc_encoder/
 
 Usage
 -----
@@ -32,103 +22,127 @@ import argparse
 import logging
 import sys
 from pathlib import Path
+from typing import Dict, List
 
+import numpy as np
 import pandas as pd
 import torch
+import torch.nn.functional as F
 import yaml
-from sentence_transformers import SentenceTransformer, InputExample
-from sentence_transformers.sentence_transformer.losses import MultipleNegativesRankingLoss
-from sentence_transformers.sentence_transformer.evaluation import InformationRetrievalEvaluator
+from sentence_transformers import SentenceTransformer
+from torch.optim import AdamW
 from torch.utils.data import DataLoader
+from tqdm import tqdm
+from transformers import get_linear_schedule_with_warmup
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from src.utils.env import configure_logging
+configure_logging()
+
 from src.data.dataset import PairDataset
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s – %(message)s",
-)
 logger = logging.getLogger(__name__)
 
 
-# ── sentence-transformers expects InputExample objects ───────────────────────
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
-class STInputExampleDataset(torch.utils.data.Dataset):
-    """Wraps our PairDataset to yield InputExample objects for ST trainer."""
-
-    def __init__(self, pair_dataset: PairDataset) -> None:
-        self.pairs = pair_dataset.pairs
-
-    def __len__(self) -> int:
-        return len(self.pairs)
-
-    def __getitem__(self, idx: int) -> InputExample:
-        anchor, positive = self.pairs[idx]
-        return InputExample(texts=[anchor, positive])
+def _encode_batch(model: SentenceTransformer, texts: List[str]) -> torch.Tensor:
+    """Tokenize and forward-pass texts, returning L2-normalised embeddings."""
+    device = next(model.parameters()).device
+    features = model.tokenize(texts)
+    # Only tensors can be moved to device; the dict may also contain strings
+    features = {k: v.to(device) if isinstance(v, torch.Tensor) else v
+                for k, v in features.items()}
+    out = model(features)
+    return F.normalize(out["sentence_embedding"], dim=-1)
 
 
-def build_ir_evaluator(
-    val_interactions: pd.DataFrame,
-    user_profiles: pd.DataFrame,
-    game_docs: pd.DataFrame,
-    name: str = "val",
-) -> InformationRetrievalEvaluator | None:
-    """
-    Build an InformationRetrievalEvaluator from validation positives.
+def _infonce_loss(q: torch.Tensor, d: torch.Tensor, temperature: float) -> torch.Tensor:
+    """Symmetric in-batch InfoNCE loss."""
+    logits = (q @ d.T) / temperature          # (B, B)
+    labels = torch.arange(len(q), device=q.device)
+    return (F.cross_entropy(logits, labels) + F.cross_entropy(logits.T, labels)) / 2
 
-    queries   : {userid: profile_text}
-    corpus    : {gameid: doc_text}
-    relevant  : {userid: {gameid, …}}
-    """
-    profile_map = dict(zip(user_profiles["userid"], user_profiles["profile_text"]))
-    doc_map     = dict(zip(game_docs["gameid"],     game_docs["doc_text"]))
 
-    val_pos = val_interactions[val_interactions["label"] == 1]
+@torch.no_grad()
+def _evaluate_val(
+    query_encoder: SentenceTransformer,
+    doc_encoder: SentenceTransformer,
+    val_pos: pd.DataFrame,
+    profile_map: Dict[str, str],
+    doc_map: Dict[str, str],
+    top_k: int = 10,
+) -> Dict[str, float]:
+    """Recall@K and MRR on val positives using the asymmetric encoders."""
+    query_encoder.eval()
+    doc_encoder.eval()
 
-    queries  = {}
-    relevant = {}
-    for uid, grp in val_pos.groupby("userid"):
-        if uid not in profile_map:
+    all_gids = list(doc_map.keys())
+    doc_embs = doc_encoder.encode(
+        [doc_map[g] for g in all_gids],
+        batch_size=128,
+        normalize_embeddings=True,
+        show_progress_bar=False,
+        convert_to_numpy=True,
+    )
+
+    val_users = [u for u in val_pos["userid"].unique() if u in profile_map]
+    if not val_users:
+        query_encoder.train()
+        doc_encoder.train()
+        return {f"Recall@{top_k}": 0.0, "MRR": 0.0}
+
+    q_embs = query_encoder.encode(
+        [profile_map[u] for u in val_users],
+        batch_size=128,
+        normalize_embeddings=True,
+        show_progress_bar=False,
+        convert_to_numpy=True,
+    )
+
+    sim = q_embs @ doc_embs.T                 # (M, N)
+    gt  = val_pos.groupby("userid")["gameid"].apply(set).to_dict()
+
+    recall_sum = mrr_sum = 0.0
+    n = 0
+    for i, uid in enumerate(val_users):
+        if uid not in gt:
             continue
-        queries[uid]  = profile_map[uid]
-        relevant[uid] = set(grp["gameid"])
+        relevant  = gt[uid]
+        top_idx   = np.argsort(-sim[i])[:top_k]
+        top_gids  = [all_gids[j] for j in top_idx]
 
-    # Only keep game IDs that appear in corpus
-    corpus = {gid: doc for gid, doc in doc_map.items()}
+        recall_sum += sum(1 for g in top_gids if g in relevant) / len(relevant)
+        for rank, g in enumerate(top_gids, start=1):
+            if g in relevant:
+                mrr_sum += 1.0 / rank
+                break
+        n += 1
 
-    logger.info(
-        "IR evaluator: %d queries, %d corpus items", len(queries), len(corpus)
-    )
-    if not queries:
-        logger.warning(
-            "No val users have pre-built profiles (profiles are derived from "
-            "training positives only). Skipping IR evaluator."
-        )
-        return None
+    query_encoder.train()
+    doc_encoder.train()
 
-    return InformationRetrievalEvaluator(
-        queries=queries,
-        corpus=corpus,
-        relevant_docs=relevant,
-        name=name,
-        show_progress_bar=True,
-        precision_recall_at_k=[1, 5, 10],
-        ndcg_at_k=[10],
-        mrr_at_k=[10],
-        batch_size=64,
-    )
+    if n == 0:
+        return {f"Recall@{top_k}": 0.0, "MRR": 0.0}
+    return {f"Recall@{top_k}": recall_sum / n, "MRR": mrr_sum / n}
 
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config",     default="config.yaml")
-    parser.add_argument("--epochs",     type=int, default=None)
-    parser.add_argument("--batch-size", type=int, default=None)
-    parser.add_argument("--no-eval",      action="store_true",
-                        help="Skip IR evaluation (faster, useful for debugging)")
+    parser.add_argument("--config",      default="config.yaml")
+    parser.add_argument("--epochs",      type=int,   default=None)
+    parser.add_argument("--batch-size",  type=int,   default=None)
+    parser.add_argument("--no-eval",     action="store_true",
+                        help="Skip per-epoch validation (faster)")
     parser.add_argument("--sample-frac", type=float, default=None,
-                        help="Use a random fraction of training pairs, e.g. 0.05 for 5%%")
+                        help="Train on a random fraction of pairs, e.g. 0.1")
     args = parser.parse_args()
 
     with open(args.config) as f:
@@ -139,22 +153,37 @@ def main() -> None:
     tr_cfg    = cfg["training"]
     model_cfg = cfg["model"]
 
-    epochs     = args.epochs     or tr_cfg["epochs"]
-    batch_size = args.batch_size or tr_cfg["batch_size"]
+    epochs      = args.epochs     or tr_cfg["epochs"]
+    batch_size  = args.batch_size or tr_cfg["batch_size"]
+    temperature = tr_cfg.get("temperature", 0.07)
+
+    # ------------------------------------------------------------------ #
+    # Device
+    # ------------------------------------------------------------------ #
+    if torch.backends.mps.is_available():
+        device = torch.device("mps")
+    elif torch.cuda.is_available():
+        device = torch.device("cuda")
+    else:
+        device = torch.device("cpu")
+    logger.info("Using device: %s", device)
 
     # ------------------------------------------------------------------ #
     # Load data
     # ------------------------------------------------------------------ #
     logger.info("Loading prepared data …")
-    game_docs      = pd.read_parquet(data_dir / "game_docs.parquet")
-    user_profiles  = pd.read_parquet(data_dir / "user_profiles.parquet")
-    interactions   = pd.read_parquet(data_dir / "interactions.parquet")
+    game_docs     = pd.read_parquet(data_dir / "game_docs.parquet")
+    user_profiles = pd.read_parquet(data_dir / "user_profiles.parquet")
+    interactions  = pd.read_parquet(data_dir / "interactions.parquet")
 
     train_ixns = interactions[interactions["split"] == "train"]
     val_ixns   = interactions[interactions["split"] == "val"]
 
+    profile_map = dict(zip(user_profiles["userid"], user_profiles["profile_text"]))
+    doc_map     = dict(zip(game_docs["gameid"],     game_docs["doc_text"]))
+
     # ------------------------------------------------------------------ #
-    # Build datasets
+    # Build pair dataset
     # ------------------------------------------------------------------ #
     logger.info("Building pair dataset …")
     pair_ds = PairDataset(train_ixns, user_profiles, game_docs)
@@ -163,60 +192,100 @@ def main() -> None:
         k = max(1, int(len(pair_ds.pairs) * args.sample_frac))
         pair_ds.pairs = random.sample(pair_ds.pairs, k)
         logger.info("Sampled %.1f%% → %d pairs", args.sample_frac * 100, k)
-    st_ds   = STInputExampleDataset(pair_ds)
-    logger.info("Training pairs: %d", len(st_ds))
+
+    logger.info("Training pairs: %d", len(pair_ds))
 
     train_loader = DataLoader(
-        st_ds,
+        pair_ds,
         batch_size=batch_size,
         shuffle=True,
-        num_workers=0,  # Keep 0 for MPS/CUDA compatibility on laptops
+        num_workers=0,
+        collate_fn=lambda batch: (
+            [item[0] for item in batch],
+            [item[1] for item in batch],
+        ),
     )
 
     # ------------------------------------------------------------------ #
-    # Model + loss
+    # Models (separate weights, same initialisation)
     # ------------------------------------------------------------------ #
-    logger.info("Initialising model: %s", model_cfg["base_model"])
-    model = SentenceTransformer(model_cfg["base_model"])
-    model.max_seq_length = model_cfg["max_seq_length"]
+    base = model_cfg["base_model"]
+    max_seq = model_cfg["max_seq_length"]
 
-    loss_fn = MultipleNegativesRankingLoss(model)
+    logger.info("Initialising query encoder: %s", base)
+    query_encoder = SentenceTransformer(base)
+    query_encoder.max_seq_length = max_seq
+    query_encoder = query_encoder.to(device)
+
+    logger.info("Initialising doc encoder: %s", base)
+    doc_encoder = SentenceTransformer(base)
+    doc_encoder.max_seq_length = max_seq
+    doc_encoder = doc_encoder.to(device)
 
     # ------------------------------------------------------------------ #
-    # Evaluator
+    # Optimizer + LR schedule
     # ------------------------------------------------------------------ #
-    evaluator = None
-    if not args.no_eval and len(val_ixns) > 0:
-        logger.info("Building IR evaluator …")
-        evaluator = build_ir_evaluator(val_ixns, user_profiles, game_docs)
-
-    # ------------------------------------------------------------------ #
-    # Training
-    # ------------------------------------------------------------------ #
-    model_out = model_dir / "two_tower"
-    model_out.mkdir(parents=True, exist_ok=True)
-
-    steps_per_epoch = len(train_loader)
-    warmup_steps = max(1, int(steps_per_epoch * epochs * tr_cfg["warmup_ratio"]))
+    all_params   = list(query_encoder.parameters()) + list(doc_encoder.parameters())
+    optimizer    = AdamW(all_params, lr=tr_cfg["learning_rate"])
+    total_steps  = len(train_loader) * epochs
+    warmup_steps = max(1, int(total_steps * tr_cfg["warmup_ratio"]))
+    scheduler    = get_linear_schedule_with_warmup(optimizer, warmup_steps, total_steps)
 
     logger.info(
-        "Starting training | epochs=%d | batch=%d | steps/epoch=%d | warmup=%d",
-        epochs, batch_size, steps_per_epoch, warmup_steps,
+        "Starting training | epochs=%d | batch=%d | steps/epoch=%d | warmup=%d | temp=%.3f",
+        epochs, batch_size, len(train_loader), warmup_steps, temperature,
     )
 
-    model.fit(
-        train_objectives=[(train_loader, loss_fn)],
-        evaluator=evaluator,
-        epochs=epochs,
-        warmup_steps=warmup_steps,
-        optimizer_params={"lr": tr_cfg["learning_rate"]},
-        output_path=str(model_out),
-        show_progress_bar=True,
-        evaluation_steps=steps_per_epoch if evaluator is not None else 0,
-        save_best_model=evaluator is not None,
-    )
+    # ------------------------------------------------------------------ #
+    # Training loop
+    # ------------------------------------------------------------------ #
+    val_pos = val_ixns[val_ixns["label"] == 1]
 
-    logger.info("✓ Training complete. Model saved to %s", model_out)
+    for epoch in range(1, epochs + 1):
+        query_encoder.train()
+        doc_encoder.train()
+
+        epoch_loss = 0.0
+        for queries, docs in tqdm(train_loader, desc=f"Epoch {epoch}/{epochs}"):
+            q_embs = _encode_batch(query_encoder, queries)
+            d_embs = _encode_batch(doc_encoder,   docs)
+
+            loss = _infonce_loss(q_embs, d_embs, temperature)
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            scheduler.step()
+
+            epoch_loss += loss.item()
+
+        avg_loss = epoch_loss / len(train_loader)
+        logger.info("Epoch %d/%d | avg_loss=%.4f", epoch, epochs, avg_loss)
+
+        if not args.no_eval and len(val_pos) > 0:
+            metrics = _evaluate_val(
+                query_encoder, doc_encoder, val_pos, profile_map, doc_map
+            )
+            logger.info(
+                "Val | Recall@10=%.4f | MRR=%.4f",
+                metrics["Recall@10"], metrics["MRR"],
+            )
+
+    # ------------------------------------------------------------------ #
+    # Save
+    # ------------------------------------------------------------------ #
+    query_out = model_dir / "query_encoder"
+    doc_out   = model_dir / "doc_encoder"
+    query_out.mkdir(parents=True, exist_ok=True)
+    doc_out.mkdir(parents=True, exist_ok=True)
+
+    logger.info("Saving query encoder → %s", query_out)
+    query_encoder.save(str(query_out))
+
+    logger.info("Saving doc encoder   → %s", doc_out)
+    doc_encoder.save(str(doc_out))
+
+    logger.info("✓ Training complete.")
 
 
 if __name__ == "__main__":

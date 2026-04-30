@@ -18,16 +18,14 @@ from pathlib import Path
 
 import yaml
 
-# Allow running from repo root
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from src.utils.env import configure_logging
+configure_logging()
 
 from src.db.connector import IFDBConnector
 from src.data.loader import extract_all, TABLES
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s – %(message)s",
-)
 logger = logging.getLogger(__name__)
 
 

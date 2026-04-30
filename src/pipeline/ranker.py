@@ -1,9 +1,10 @@
 """Stage 2: cross-encoder reranking and offline evaluation metrics."""
 
 import logging
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
+import torch
 from sentence_transformers import CrossEncoder
 
 logger = logging.getLogger(__name__)
@@ -22,12 +23,25 @@ class Reranker:
         candidates: List[Tuple[str, float]],
         game_doc_lookup: Dict[str, str],
         top_k: int = 10,
+        bayesian_avg_map: Optional[Dict[str, float]] = None,
+        rating_weight: float = 0.5,
+        max_rating: float = 5.0,
+        min_ce_score: Optional[float] = None,
     ) -> List[Tuple[str, float]]:
         """
         Re-score candidates with the cross-encoder and return the top-K.
 
-        candidates: list of (gameid, retrieval_score) from the bi-encoder stage
-        game_doc_lookup: gameid → document text
+        Raw cross-encoder logits are passed through sigmoid to yield 0–1 scores.
+        Candidates whose sigmoid score falls below min_ce_score are dropped before
+        any further processing.
+        If bayesian_avg_map is provided, the final score is a weighted blend of
+        the cross-encoder probability and the normalised Bayesian average rating:
+            score = (1 - rating_weight) * ce_prob + rating_weight * (bay_avg / max_rating)
+
+        candidates:       list of (gameid, retrieval_score) from the bi-encoder stage
+        game_doc_lookup:  gameid → document text
+        bayesian_avg_map: optional gameid → bayesian_avg for rating blending
+        min_ce_score:     drop candidates with sigmoid cross-encoder score below this
         """
         if not candidates:
             return []
@@ -35,9 +49,140 @@ class Reranker:
         game_ids = [gid for gid, _ in candidates]
         pairs = [(query_text, game_doc_lookup.get(gid, "")) for gid in game_ids]
 
-        scores = self.model.predict(pairs, show_progress_bar=False)
-        ranked = sorted(zip(game_ids, scores.tolist()), key=lambda x: -x[1])
-        return ranked[:top_k]
+        raw = self.model.predict(pairs, show_progress_bar=False)
+        ce_scores = torch.sigmoid(torch.tensor(raw, dtype=torch.float32)).numpy()
+
+        # Filter by cross-encoder score before blending
+        if min_ce_score is not None:
+            kept = [(gid, float(s)) for gid, s in zip(game_ids, ce_scores) if s >= min_ce_score]
+        else:
+            kept = [(gid, float(s)) for gid, s in zip(game_ids, ce_scores)]
+
+        if bayesian_avg_map is not None:
+            results = []
+            for gid, ce_s in kept:
+                bay_s = bayesian_avg_map.get(gid, max_rating / 2) / max_rating
+                score = (1.0 - rating_weight) * ce_s + rating_weight * bay_s
+                results.append((gid, score))
+        else:
+            results = kept
+
+        return sorted(results, key=lambda x: -x[1])[:top_k]
+
+
+# ---------------------------------------------------------------------------
+# Post-rerank diversity
+# ---------------------------------------------------------------------------
+
+def _game_genres(game_info_map: Dict[str, dict], gid: str) -> set:
+    return {g.strip() for g in str(game_info_map.get(gid, {}).get("genre", "")).split(",") if g.strip()}
+
+
+def _game_system(game_info_map: Dict[str, dict], gid: str) -> str:
+    return str(game_info_map.get(gid, {}).get("system", "")).strip()
+
+
+def _coverage(
+    candidates: List[Tuple[str, float]],
+    game_info_map: Dict[str, dict],
+) -> Tuple[set, set]:
+    covered_genres: set = set()
+    covered_systems: set = set()
+    for gid, _ in candidates:
+        covered_genres |= _game_genres(game_info_map, gid)
+        s = _game_system(game_info_map, gid)
+        if s:
+            covered_systems.add(s)
+    return covered_genres, covered_systems
+
+
+def _split_field(info: dict, key: str) -> set:
+    return {v.strip().lower() for v in str(info.get(key, "")).split(",") if v.strip()}
+
+
+def diversify_results(
+    candidates: List[Tuple[str, float]],
+    game_info_map: Dict[str, dict],
+    target_genres: set,
+    target_systems: set,
+    top_k: int,
+    max_author_appearances: int = 2,
+) -> List[Tuple[str, float]]:
+    """
+    Select top_k from a fully scored + sorted candidate list with two passes:
+
+    1. Deduplication — a candidate is dropped if adding it would cause any individual
+       author to appear more than max_author_appearances times across the selected results.
+    2. Coverage — if the initial top_k misses a target genre or system,
+       the highest-scored remaining candidate covering that target is swapped
+       in, displacing the lowest-scoring initial item.
+
+    candidates:     all scored (gameid, score) pairs, sorted descending by score
+    game_info_map:  gameid → {'genre': comma-sep str, 'system': str, 'author': str}
+    target_genres:  genre strings to aim to cover (from user profile or seed game)
+    target_systems: system strings to aim to cover
+    """
+    # Pass 1: deduplicate — skip if any individual author would exceed max_author_appearances.
+    deduped: List[Tuple[str, float]] = []
+    author_counts: Dict[str, int] = {}
+    for gid, score in candidates:
+        info = game_info_map.get(gid, {})
+        game_authors = _split_field(info, "author")
+        if any(author_counts.get(a, 0) >= max_author_appearances for a in game_authors):
+            continue
+        deduped.append((gid, score))
+        for a in game_authors:
+            author_counts[a] = author_counts.get(a, 0) + 1
+
+    if not target_genres and not target_systems:
+        return deduped[:top_k]
+
+    if len(deduped) <= top_k:
+        return deduped
+
+    # Pass 2: coverage enforcement on the deduped pool
+    initial = deduped[:top_k]
+    rest = deduped[top_k:]
+
+    covered_genres, covered_systems = _coverage(initial, game_info_map)
+    missing_genres = target_genres - covered_genres
+    missing_systems = target_systems - covered_systems
+
+    if not missing_genres and not missing_systems:
+        return initial
+
+    inserts: List[Tuple[str, float]] = []
+    used: set = set()  # indices into rest already claimed
+
+    for genre in sorted(missing_genres):
+        if any(genre in _game_genres(game_info_map, gid) for gid, _ in inserts):
+            continue  # already covered by a prior insert
+        for i, (gid, score) in enumerate(rest):
+            if i in used:
+                continue
+            if genre in _game_genres(game_info_map, gid):
+                inserts.append((gid, score))
+                used.add(i)
+                break
+
+    for system in sorted(missing_systems):
+        if any(_game_system(game_info_map, gid) == system for gid, _ in inserts):
+            continue
+        for i, (gid, score) in enumerate(rest):
+            if i in used:
+                continue
+            if _game_system(game_info_map, gid) == system:
+                inserts.append((gid, score))
+                used.add(i)
+                break
+
+    if not inserts:
+        return initial
+
+    n_keep = max(0, top_k - len(inserts))
+    result = initial[:n_keep] + inserts
+    result.sort(key=lambda x: -x[1])
+    return result[:top_k]
 
 
 # ---------------------------------------------------------------------------

@@ -11,9 +11,10 @@ logger = logging.getLogger(__name__)
 
 # MySQL table name → parquet filename
 TABLES: dict[str, str] = {
-    "games":   "games.parquet",
-    "reviews": "reviews.parquet",
-    "users":   "users.parquet",
+    "games":       "games.parquet",
+    "reviews":     "reviews.parquet",
+    "users":       "users.parquet",
+    "playedgames": "playedgames.parquet",
 }
 
 # IFDB uses "ifid" as the game primary key in some dumps; normalise to "gameid".
@@ -74,6 +75,9 @@ def extract_table(
         return
 
     if table == "users":
+        df = _normalise_user_id(df)
+    elif table == "playedgames":
+        df = _normalise_game_id(df)
         df = _normalise_user_id(df)
     else:
         df = _normalise_game_id(df)
