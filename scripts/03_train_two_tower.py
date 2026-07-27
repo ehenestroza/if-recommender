@@ -11,18 +11,22 @@ Training uses symmetric InfoNCE loss: each (query_i, doc_i) pair treats
 for doc_i. Both encoders are updated jointly via a shared AdamW optimizer
 with linear warmup.
 
+The encoders saved are the ones from the epoch with the best validation
+Recall@10, not necessarily the last: training loss keeps falling after
+validation has peaked. Pass --save-last for the final epoch regardless.
+
 Outputs: models/query_encoder/, models/doc_encoder/
 
 Usage
 -----
-    python scripts/03_train_two_tower.py [--epochs N] [--batch-size N]
+    python scripts/03_train_two_tower.py [--epochs N] [--batch-size N] [--save-last]
 """
 
 import argparse
 import logging
 import sys
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -58,6 +62,17 @@ def _encode_batch(model: SentenceTransformer, texts: List[str]) -> torch.Tensor:
                 for k, v in features.items()}
     out = model(features)
     return F.normalize(out["sentence_embedding"], dim=-1)
+
+
+def _cpu_state(model: SentenceTransformer) -> dict:
+    """
+    Snapshot a model's weights as detached CPU tensors.
+
+    The copy matters: state_dict() hands back live references to the parameters,
+    which the next epoch mutates in place, so a snapshot taken without cloning
+    would silently track training instead of preserving the epoch it came from.
+    """
+    return {k: v.detach().to("cpu", copy=True) for k, v in model.state_dict().items()}
 
 
 def _infonce_loss(q: torch.Tensor, d: torch.Tensor, temperature: float) -> torch.Tensor:
@@ -139,6 +154,8 @@ def main() -> None:
     parser.add_argument("--config",      default="config.yaml")
     parser.add_argument("--epochs",      type=int,   default=None)
     parser.add_argument("--batch-size",  type=int,   default=None)
+    parser.add_argument("--save-last",   action="store_true",
+                        help="Save the final epoch instead of the best-validating one")
     parser.add_argument("--no-eval",     action="store_true",
                         help="Skip per-epoch validation (faster)")
     parser.add_argument("--sample-frac", type=float, default=None,
@@ -241,6 +258,12 @@ def main() -> None:
     # ------------------------------------------------------------------ #
     val_pos = val_ixns[val_ixns["label"] == 1]
 
+    # Best-so-far checkpoint, kept on the CPU so it survives the next epoch's
+    # in-place weight updates without occupying accelerator memory.
+    best_score: Optional[Tuple[float, float]] = None
+    best_state: Optional[Dict[str, dict]] = None
+    best_epoch = 0
+
     for epoch in range(1, epochs + 1):
         query_encoder.train()
         doc_encoder.train()
@@ -271,9 +294,38 @@ def main() -> None:
                 metrics["Recall@10"], metrics["MRR"],
             )
 
+            # Select on Recall@10, break ties on MRR.
+            score = (metrics["Recall@10"], metrics["MRR"])
+            if best_score is None or score > best_score:
+                best_score, best_epoch = score, epoch
+                best_state = {
+                    "query": _cpu_state(query_encoder),
+                    "doc":   _cpu_state(doc_encoder),
+                }
+                logger.info("Val | new best (epoch %d)", epoch)
+
     # ------------------------------------------------------------------ #
-    # Save
+    # Save — the best-validating epoch, not necessarily the last one
     # ------------------------------------------------------------------ #
+    if best_state is None:
+        # No validation ran (--no-eval, or an empty val split): nothing to
+        # select on, so the final epoch is all we have.
+        logger.info("Saving final-epoch weights (epoch %d) — no validation to select on", epochs)
+    elif args.save_last:
+        logger.info(
+            "Saving final-epoch weights (epoch %d) as requested; best was epoch %d "
+            "(Recall@10=%.4f)", epochs, best_epoch, best_score[0],
+        )
+    elif best_epoch == epochs:
+        logger.info("Best epoch was the last (epoch %d, Recall@10=%.4f)", best_epoch, best_score[0])
+    else:
+        logger.info(
+            "Restoring epoch %d — best Recall@10=%.4f, MRR=%.4f (final epoch %d was worse)",
+            best_epoch, best_score[0], best_score[1], epochs,
+        )
+        query_encoder.load_state_dict(best_state["query"])
+        doc_encoder.load_state_dict(best_state["doc"])
+
     query_out = model_dir / "query_encoder"
     doc_out   = model_dir / "doc_encoder"
     query_out.mkdir(parents=True, exist_ok=True)

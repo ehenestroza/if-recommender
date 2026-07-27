@@ -1,0 +1,86 @@
+{
+  "source": {
+    "path": "dump/ifdb-archive.sql.gz",
+    "sha256": "b7ce4b69f2b8e74756071bc15dd46f5a33ba86dc42ba6595156aa345834a625c"
+  },
+  "tables": {
+    "games": {
+      "columns": [
+        "gameid",
+        "title",
+        "author",
+        "authorExt",
+        "sort_title",
+        "sort_author",
+        "tags",
+        "published",
+        "version",
+        "license",
+        "system",
+        "language",
+        "desc",
+        "coverart",
+        "seriesname",
+        "seriesnumber",
+        "genre",
+        "forgiveness",
+        "bafsid",
+        "website",
+        "downloadnotes",
+        "created",
+        "editedby",
+        "moddate",
+        "pagevsn",
+        "flags"
+      ],
+      "file": "games.parquet",
+      "rows": 15544,
+      "sha256": "55580c800cfe22004578ce0ab235377b07fd18b83d111aab58bd389a88412457"
+    },
+    "playedgames": {
+      "columns": [
+        "userid",
+        "gameid",
+        "date_added"
+      ],
+      "file": "playedgames.parquet",
+      "rows": 71033,
+      "sha256": "ba72418bb7cbfc33e8a37b7f64a970e3b0783f5eb514d9da05b1c322846cadee"
+    },
+    "reviews": {
+      "columns": [
+        "id",
+        "summary",
+        "review",
+        "rating",
+        "userid",
+        "createdate",
+        "moddate",
+        "embargodate",
+        "special",
+        "gameid",
+        "RFlags",
+        "embargopastdate"
+      ],
+      "file": "reviews.parquet",
+      "rows": 80244,
+      "sha256": "dcd36b4ae670f59571c5e6a748b922cd6be38f8c645ce059a48e3d9cdcee305a"
+    },
+    "users": {
+      "columns": [
+        "userid",
+        "name",
+        "gender",
+        "publicemail",
+        "location",
+        "profile",
+        "picture",
+        "created",
+        "welcomeopen"
+      ],
+      "file": "users.parquet",
+      "rows": 20024,
+      "sha256": "edaeebd09e9d59e67faffa783eb361bc89df25cadb12fb22ad01ca72115fb631"
+    }
+  }
+}

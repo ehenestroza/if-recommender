@@ -8,6 +8,8 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
+from src.data.columns import clean_col, clean_col_in
+
 logger = logging.getLogger(__name__)
 
 _COMP_RE = re.compile(
@@ -16,6 +18,61 @@ _COMP_RE = re.compile(
     r"(winner)|(playoff)|(inklewriter)|(storynexus)|(choicescript)|(ink)|(student project)", re.IGNORECASE)
 
 _MAX_TAGS = 20
+
+
+def format_profile_text(systems: List[str], tags: List[str]) -> str:
+    """
+    Build the query string the encoders were trained on.
+
+    Every query the model sees — user profiles, game profiles, and queries built
+    from a UI's system/tag pickers — must use this exact shape, so it lives in one
+    place rather than being re-spelled at each call site:
+
+        "Systems: twine, ink. Tags: fantasy, horror"
+
+    Values should be the normalised `_clean` forms; IFDB's own casing
+    ("Inform 7", "IFComp 2019") is not what the encoders saw during training.
+    """
+    parts: List[str] = []
+    if systems:
+        parts.append(f"Systems: {', '.join(systems)}")
+    if tags:
+        parts.append(f"Tags: {', '.join(tags)}")
+    return ". ".join(parts)
+
+
+def parse_profile_text(text: str) -> Tuple[List[str], List[str]]:
+    """Inverse of `format_profile_text` — recover (systems, tags) from a query."""
+    systems: List[str] = []
+    tags: List[str] = []
+    for part in str(text).split(". "):
+        part = part.strip()
+        if part.startswith("Systems:"):
+            systems = [v.strip() for v in part[len("Systems:"):].split(",") if v.strip()]
+        elif part.startswith("Tags:"):
+            tags = [v.strip() for v in part[len("Tags:"):].split(",") if v.strip()]
+    return systems, tags
+
+
+def profile_vocabulary(
+    game_docs: pd.DataFrame, n_systems: int = 12, n_tags: int = 40
+) -> Tuple[List[str], List[str]]:
+    """
+    Most common system and tag values, for populating a UI's pickers.
+
+    Drawn from the `_clean` columns so the options a user selects are exactly the
+    strings the encoders were trained on.
+    """
+    system_counts: Counter = Counter()
+    tag_counts: Counter = Counter()
+    for value in game_docs[clean_col("system")].fillna(""):
+        system_counts.update(v.strip() for v in str(value).split(",") if v.strip())
+    for value in game_docs[clean_col("tags")].fillna(""):
+        tag_counts.update(v.strip() for v in str(value).split(",") if v.strip())
+    return (
+        [s for s, _ in system_counts.most_common(n_systems)],
+        [t for t, _ in tag_counts.most_common(n_tags)],
+    )
 
 
 def _dedupe_ordered(items: List[str]) -> List[str]:
@@ -80,20 +137,24 @@ def build_game_documents(
     """
     Build a structured text document for each game (item-tower input).
 
-    Genres and systems are stored as comma-separated lowercase values.
-    Tags are filtered of competition noise, deduplicated (order-preserving),
-    and capped at 20 entries. A Bayesian-smoothed rating is included as a
-    quality signal.
+    Normalisation is written to `_clean` columns and the IFDB originals are kept
+    untouched beside them, so the interactive system can show exactly what
+    ifdb.org shows while the encoders see the normalised text:
+
+      author  → author_clean   split on ',' '/' 'and', deduplicated, rejoined
+      system  → system_clean   parentheticals and version numbers stripped, lowercased
+      tags    → tags_clean     genre folded in, competition tags dropped, capped at 20
+
+    `genre` has no `_clean` variant: its values are folded into tags_clean.
+    `year` is extracted from the original `published` timestamp for range filters.
+    A Bayesian-smoothed rating is included as a quality signal.
 
     Only includes games where title, author, and desc are all non-empty and
     that have received at least min_reviews ratings.
-
-    Returns columns: gameid, title, author, genre, system, tags,
-                     avg_rating, bayesian_avg, review_count, doc_text, query_text.
     """
     docs = games.copy()
 
-    for col in ("tags", "desc", "genre", "system", "title", "author"):
+    for col in ("tags", "desc", "genre", "system", "title", "author", "published"):
         if col not in docs.columns:
             docs[col] = ""
         else:
@@ -128,17 +189,17 @@ def build_game_documents(
     docs = docs[docs["review_count"] >= min_reviews].copy()
 
     # Clean author: split on , / 'and', deduplicate, rejoin as comma-separated
-    docs["author"] = docs["author"].apply(
+    docs[clean_col("author")] = docs["author"].apply(
         lambda a: ", ".join(_split_authors(str(a)))
     )
 
     # Clean system: strip parentheticals and version numbers, split on , /,
     # deduplicate, store as comma-separated lowercase
-    docs["system"] = docs["system"].apply(
+    docs[clean_col("system")] = docs["system"].apply(
         lambda s: ", ".join(_split_system(str(s)))
     )
 
-    # Extract publication year from 'published' field (display-only, not used in model)
+    # Extract publication year from 'published' field (display + range filters)
     if "published" in docs.columns:
         docs["year"] = docs["published"].apply(
             lambda p: (m := _YEAR_RE.search(str(p))) and m.group(0) or ""
@@ -154,14 +215,15 @@ def build_game_documents(
         combined   = _dedupe_ordered(genre_vals + tag_vals)[:_MAX_TAGS]
         return ", ".join(combined)
 
-    docs["tags"] = docs.apply(_merge_genre_tags, axis=1)
+    docs[clean_col("tags")] = docs.apply(_merge_genre_tags, axis=1)
 
+    # Encoder inputs are built from the normalised columns only.
     def _make_doc(row: pd.Series) -> str:
-        parts = [f"Title: {row['title']}", f"Author: {row['author']}"]
-        if str(row["system"]).strip():
-            parts.append(f"Systems: {row['system']}")
-        if str(row["tags"]).strip():
-            parts.append(f"Tags: {row['tags']}")
+        parts = [f"Title: {row['title']}", f"Author: {row[clean_col('author')]}"]
+        if str(row[clean_col("system")]).strip():
+            parts.append(f"Systems: {row[clean_col('system')]}")
+        if str(row[clean_col("tags")]).strip():
+            parts.append(f"Tags: {row[clean_col('tags')]}")
         snippet = str(row["desc"])[:500].strip()
         if snippet:
             parts.append(f"Description: {snippet}")
@@ -169,17 +231,18 @@ def build_game_documents(
 
     def _make_query_doc(row: pd.Series) -> str:
         """Game profile text without title/author/desc — matches user profile format."""
-        parts = []
-        if str(row["system"]).strip():
-            parts.append(f"Systems: {row['system']}")
-        if str(row["tags"]).strip():
-            parts.append(f"Tags: {row['tags']}")
-        return ". ".join(parts)
+        systems = [str(row[clean_col("system")])] if str(row[clean_col("system")]).strip() else []
+        tags = [str(row[clean_col("tags")])] if str(row[clean_col("tags")]).strip() else []
+        return format_profile_text(systems, tags)
 
     docs["doc_text"]   = docs.apply(_make_doc, axis=1)
     docs["query_text"] = docs.apply(_make_query_doc, axis=1)
 
-    keep = ["gameid", "title", "author", "year", "system", "tags",
+    keep = ["gameid", "title",
+            # IFDB originals — what the interactive system displays
+            "author", "genre", "system", "tags", "published", "year",
+            # normalised variants — what the models and filters consume
+            clean_col("author"), clean_col("system"), clean_col("tags"),
             "avg_rating", "bayesian_avg", "review_count", "doc_text", "query_text"]
     return docs[keep].reset_index(drop=True)
 
@@ -360,10 +423,12 @@ def build_user_profiles(
     else:
         combined = pos.copy()
 
-    # Pre-build lookup maps from game_docs
+    # Pre-build lookup maps from game_docs. Profile text is encoder input, so it
+    # is built from the normalised columns (falling back to the originals for
+    # game_docs files written before the clean/original split).
     game_docs_idx = game_docs.set_index("gameid")
-    system_map = game_docs_idx["system"].to_dict()  # comma-separated lowercase systems
-    tags_map   = game_docs_idx["tags"].to_dict()    # filtered, genre-prepended, capped
+    system_map = game_docs_idx[clean_col_in(game_docs.columns, "system")].to_dict()
+    tags_map   = game_docs_idx[clean_col_in(game_docs.columns, "tags")].to_dict()
 
     # Name lookup from users table
     name_lookup: Dict[str, str] = {}
@@ -390,19 +455,14 @@ def build_user_profiles(
         top_systems = [s for s, _ in Counter(systems).most_common(3)]
         top_tags    = [t for t, _ in Counter(tags).most_common(_MAX_TAGS)]
 
-        parts: List[str] = []
-        if top_systems:
-            parts.append(f"Systems: {', '.join(top_systems)}")
-        if top_tags:
-            parts.append(f"Tags: {', '.join(top_tags)}")
-
-        if not parts:
+        profile_text = format_profile_text(top_systems, top_tags)
+        if not profile_text:
             continue
 
         profiles.append({
             "userid":       uid,
             "name":         name_lookup.get(str(uid), ""),
-            "profile_text": ". ".join(parts),
+            "profile_text": profile_text,
         })
 
     return pd.DataFrame(profiles)

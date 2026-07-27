@@ -19,6 +19,9 @@ class IFDBConnector:
             host=host,
             port=port,
             database=database,
+            # IFDB stores review and game text as utf8mb4; without this the
+            # connection falls back to the server default and mangles accents.
+            query={"charset": "utf8mb4"},
         )
         self._engine = sa.create_engine(url, pool_pre_ping=True)
         logger.info("Connecting to %s@%s:%s/%s", user, host, port, database)

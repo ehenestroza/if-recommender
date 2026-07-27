@@ -4,11 +4,21 @@ paths:
   index_dir: "outputs"
 
 database:
+  # Live server, used by: 01_extract.py --source mysql
   host: "localhost"
   port: 3306
   user: "root"
   password: ""          # override with env var IFDB_DB_PASSWORD
   database: "ifarchive"
+
+  # Raw IFDB dump served from a disposable container, used by: 01_extract.py --source dump
+  dump:
+    path: "dump/ifdb-archive.sql.gz"   # .sql or .sql.gz; not version controlled
+    image: "mariadb:10.5.26"           # pinned to the server version in the dump header
+    container_name: "ifdb-extract"
+    tmpfs_size: "3g"                   # datadir in RAM; set to "" to use container storage
+    startup_timeout_s: 180
+    import_timeout_s: 3600
 
 model:
   base_model: "sentence-transformers/all-MiniLM-L6-v2"
@@ -38,11 +48,13 @@ reranker_training:
 
 retrieval:
   min_retrieval_score: 0.25   # drop candidates with cosine similarity below this
-  min_rerank_score: 0.5       # drop reranked candidates with cross-encoder sigmoid score below this
-  top_k_retrieve: 50          # max candidates passed to the reranker after hard filtering
+  min_rerank_score: 0.10      # relevance floor; low enough to leave filter headroom, high enough to display
+  top_k_retrieve: 50          # raw-retrieval evaluation only; the pipeline reranks the whole pool
   top_k_rerank: 25
+  rerank_pool_cap: 0          # max candidates scored live; 0 = no cap. Precomputed modes ignore it
+  prefilter_by_tag: true      # drop candidates sharing no tag with the query (measured free)
   index_type: "flat"          # "hnsw" for faster approximate search at scale
   hnsw_m: 32
   use_rating_reranking: true  # blend normalised bayesian_avg into rerank score
-  rating_weight: 0.5          # weight given to bayesian_avg when blending
+  rating_weight: 0.5          # weight on bayesian_avg/5; 0.3-0.5 measure the same, above 0.5 hurts
   use_diversity: true         # post-rerank step to cover all target genres/systems

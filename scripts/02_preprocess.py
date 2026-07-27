@@ -18,6 +18,7 @@ Usage
     python scripts/02_preprocess.py
 """
 
+import argparse
 import logging
 import sys
 from pathlib import Path
@@ -42,7 +43,11 @@ logger = logging.getLogger(__name__)
 
 
 def main() -> None:
-    with open("config.yaml") as f:
+    parser = argparse.ArgumentParser(description="Build training data from raw Parquet")
+    parser.add_argument("--config", default="config.yaml")
+    args = parser.parse_args()
+
+    with open(args.config) as f:
         cfg = yaml.safe_load(f)
 
     data_dir = Path(cfg["paths"]["data_dir"])

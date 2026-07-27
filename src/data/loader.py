@@ -1,9 +1,13 @@
 """Load IFDB tables from MySQL and cache them as Parquet files."""
 
+import hashlib
+import json
 import logging
 from pathlib import Path
 
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 from src.db.connector import IFDBConnector
 
@@ -57,6 +61,35 @@ def _coerce_object_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _ordering_columns(connector: IFDBConnector, table: str) -> list[str]:
+    """
+    Columns to sort by so that a re-extraction produces the same row order.
+
+    MySQL makes no promise about the order of an unsorted SELECT, so we sort by
+    the primary key.  `playedgames` has none; there we sort by every column,
+    which is what determinism requires anyway once rows can tie.
+    """
+    keys = connector.read_query(f"SHOW KEYS FROM `{table}` WHERE Key_name = 'PRIMARY'")
+    if len(keys):
+        return keys.sort_values("Seq_in_index")["Column_name"].tolist()
+    return connector.read_query(f"SHOW COLUMNS FROM `{table}`")["Field"].tolist()
+
+
+def _write_parquet(df: pd.DataFrame, dest: Path) -> None:
+    """Write `df` without the pandas/pyarrow version stamp in the metadata."""
+    arrow = pa.Table.from_pandas(df, preserve_index=False).replace_schema_metadata(None)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    pq.write_table(arrow, dest)
+
+
+def sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for block in iter(lambda: fh.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
 def extract_table(
     connector: IFDBConnector,
     table: str,
@@ -69,7 +102,8 @@ def extract_table(
 
     logger.info("  Fetching table '%s' …", table)
     try:
-        df = connector.read_table(table)
+        order = ", ".join(f"`{c}`" for c in _ordering_columns(connector, table))
+        df = connector.read_query(f"SELECT * FROM `{table}` ORDER BY {order}")
     except Exception as exc:
         logger.warning("  Could not fetch '%s': %s", table, exc)
         return
@@ -82,8 +116,7 @@ def extract_table(
     else:
         df = _normalise_game_id(df)
     df = _coerce_object_columns(df)
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    df.to_parquet(dest, index=False)
+    _write_parquet(df, dest)
     logger.info("  Saved %s  (%d rows)", dest.name, len(df))
 
 
@@ -95,6 +128,38 @@ def extract_all(
     data_dir = Path(data_dir)
     for table, filename in TABLES.items():
         extract_table(connector, table, data_dir / filename, overwrite=overwrite)
+
+
+MANIFEST = "manifest.json"
+
+
+def write_manifest(data_dir: Path, source: Path | None = None) -> dict:
+    """
+    Record what is in the Parquet cache and what it was built from.
+
+    Deliberately free of timestamps: two manifests compare equal exactly when
+    the datasets do, which turns "did the data change?" into one diff.
+    """
+    data_dir = Path(data_dir)
+    manifest: dict = {"source": None, "tables": {}}
+    if source is not None and Path(source).exists():
+        manifest["source"] = {"path": str(source), "sha256": sha256(Path(source))}
+
+    for table, filename in TABLES.items():
+        path = data_dir / filename
+        if not path.exists():
+            continue
+        frame = pd.read_parquet(path)
+        manifest["tables"][table] = {
+            "file": filename,
+            "rows": len(frame),
+            "columns": list(frame.columns),
+            "sha256": sha256(path),
+        }
+
+    (data_dir / MANIFEST).write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+    logger.info("Wrote %s", data_dir / MANIFEST)
+    return manifest
 
 
 def load_parquet(data_dir: Path, filename: str) -> pd.DataFrame:

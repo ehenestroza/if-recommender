@@ -25,7 +25,7 @@ import logging
 import pickle
 import sys
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -40,8 +40,9 @@ from sentence_transformers import SentenceTransformer, CrossEncoder
 
 from src.index.faiss_index import GameIndex
 from src.pipeline.retriever import Retriever
+from src.data.preprocessor import parse_profile_text
 from src.pipeline.ranker import Reranker, evaluate_retrieval, diversify_results
-from src.pipeline.retriever import apply_hard_filters, cap_candidates_by_author
+from src.pipeline.retriever import apply_hard_filters, filter_by_tag_overlap
 
 logger = logging.getLogger(__name__)
 
@@ -57,14 +58,43 @@ except ImportError:
 # Pretty printing
 # ---------------------------------------------------------------------------
 
-def _game_row_cells(gid: str, score: str, meta: pd.DataFrame) -> tuple:
+# Shown instead of a score when nobody has rated a game.
+NO_RATING = "—"
+
+
+def _rating_cell(row: dict) -> str:
+    """
+    Rating column text: "3.8 (2)", or an em dash when the game has no ratings.
+
+    Shows the raw community average. `bayesian_avg` is a ranking signal — it
+    shrinks toward a 3.5 prior — so displaying it would report a score nobody
+    actually gave, and for unrated games would be the prior alone.
+    """
+    try:
+        count = int(row["review_count"])
+        if count == 0:
+            return NO_RATING
+        value = float(row["avg_rating"])
+        return "" if pd.isna(value) else f"{value:.1f} ({count})"
+    except (KeyError, TypeError, ValueError):
+        return ""
+
+
+def _rating_suffix(row: dict) -> str:
+    """Same distinction as `_rating_cell`, for the plain-text (no-Rich) output."""
+    cell = _rating_cell(row)
+    if not cell:
+        return ""
+    return "  (unrated)" if cell == NO_RATING else f"  ★{cell.split(' ')[0]}"
+
+
+def _game_row_cells(
+    gid: str, score: str, meta: pd.DataFrame, relevance: Optional[dict] = None
+) -> tuple:
     """Return display cells for one game row (shared between tables)."""
     # Convert Series → plain dict so subsequent .get() calls return scalars.
     row: dict = meta.loc[gid].to_dict() if gid in meta.index else {}
-    try:
-        rating_str = f"{float(row['bayesian_avg']):.1f} ({int(row['review_count'])})"
-    except (KeyError, TypeError, ValueError):
-        rating_str = ""
+    rel = relevance.get(gid) if relevance else None
     return (
         score,
         str(row.get("title", gid)),
@@ -72,7 +102,8 @@ def _game_row_cells(gid: str, score: str, meta: pd.DataFrame) -> tuple:
         str(row.get("year", "")),
         str(row.get("system", "")),
         str(row.get("tags", "")),
-        rating_str,
+        "–" if rel is None else f"{rel:.2f}",
+        _rating_cell(row),
     )
 
 
@@ -84,10 +115,17 @@ def _add_game_columns(table) -> None:
     table.add_column("Year",   style="dim",         width=6)
     table.add_column("System", style="blue")
     table.add_column("Tags",   style="violet")
-    table.add_column("Rating", style="magenta",    width=12)
+    # The two components of Score, shown so their trade-off is visible.
+    table.add_column("Relev.", style="green",      width=6)
+    table.add_column("Rating", style="magenta",    width=10)
 
 
-def print_results(results: List[tuple], game_meta: pd.DataFrame, query: str) -> None:
+def print_results(
+    results: List[tuple],
+    game_meta: pd.DataFrame,
+    query: str,
+    relevance: Optional[dict] = None,
+) -> None:
     """Display top-K results in a readable table."""
     meta = game_meta.set_index("gameid")
 
@@ -97,20 +135,19 @@ def print_results(results: List[tuple], game_meta: pd.DataFrame, query: str) -> 
         table.add_column("#", style="dim", width=4)
         _add_game_columns(table)
         for rank, (gid, score) in enumerate(results, start=1):
-            table.add_row(str(rank), *_game_row_cells(gid, f"{score:.4f}", meta))
+            table.add_row(str(rank), *_game_row_cells(gid, f"{score:.4f}", meta, relevance))
         console.print(table)
     else:
         print(f"\nResults for: {query}")
         print("-" * 80)
         for rank, (gid, score) in enumerate(results, start=1):
             row: dict = meta.loc[gid].to_dict() if gid in meta.index else {}
-            try:
-                rating_str = f"  ★{float(row['bayesian_avg']):.1f}"
-            except (KeyError, TypeError, ValueError):
-                rating_str = ""
+            rating_str = _rating_suffix(row)
             year = row.get("year", "")
             year_str = f" {year}" if year else ""
-            print(f"  {rank:2d}. [{score:.4f}] {row.get('title', gid)} "
+            rel = relevance.get(gid) if relevance else None
+            rel_str = f" rel {rel:.2f}" if rel is not None else ""
+            print(f"  {rank:2d}. [{score:.4f}]{rel_str} {row.get('title', gid)} "
                   f"({row.get('author','')}){year_str} — {row.get('system','')}{rating_str}")
         print()
 
@@ -126,10 +163,7 @@ def print_game_summary(gid: str, game_meta: pd.DataFrame, label: str = "Game") -
         console.print(table)
     else:
         row: dict = meta.loc[gid].to_dict() if gid in meta.index else {}
-        try:
-            rating_str = f"  ★{float(row['bayesian_avg']):.1f}"
-        except (KeyError, TypeError, ValueError):
-            rating_str = ""
+        rating_str = _rating_suffix(row)
         year = row.get("year", "")
         year_str = f" {year}" if year else ""
         print(f"\n{label}: {row.get('title', gid)} "
@@ -256,6 +290,69 @@ def _parse_filters(raw: str) -> dict:
     return filters
 
 
+def load_precomputed(path: Path, key_col: str) -> dict:
+    """
+    Load a precomputed ranking file into {key: (gameids, scores, relevances)}.
+
+    Returns {} when the file is absent, so the pipeline falls back to scoring
+    live. Arrays rather than tuples keep 1.6M rows to a manageable footprint.
+    """
+    if not path.exists():
+        return {}
+    frame = pd.read_parquet(path)
+    table = {
+        key: (grp["gameid"].tolist(), grp["score"].to_numpy(), grp["relevance"].to_numpy())
+        for key, grp in frame.groupby(key_col, sort=False)
+    }
+    logger.info("Loaded %s — %d keys", path.name, len(table))
+    return table
+
+
+FILTER_HELP = """  Refine these results with filters, e.g.  year:2020-2026; rating:3.5; count:2
+  Keys: year, author, system, tags, rating, count   (each entry replaces the last)
+  'clear' show all again  ·  'back' new query  ·  'quit' exit"""
+
+
+def show_results(
+    scored: List[tuple],
+    hard_filters: dict,
+    *,
+    game_docs: pd.DataFrame,
+    game_info_map: Optional[dict],
+    top_k: int,
+    use_diversity: bool,
+    target_genres: set,
+    target_systems: set,
+    label: str,
+    relevance: Optional[dict] = None,
+) -> None:
+    """
+    Filter, diversify, and print a slice of an already-scored candidate list.
+
+    `scored` is the whole reranked pool for one query, so filtering here strictly
+    narrows what the user is already looking at rather than changing which
+    candidates ever reached the reranker.
+    """
+    results = scored
+    if hard_filters and game_info_map is not None:
+        results = apply_hard_filters(results, game_info_map, **hard_filters)
+        logger.info("Filters kept %d of %d scored candidates", len(results), len(scored))
+
+    if game_info_map is not None:
+        # diversify_results caps repeat authors even with no coverage targets,
+        # which is why no separate author-cap pass is needed before reranking.
+        genres = target_genres if use_diversity else set()
+        systems = target_systems if use_diversity else set()
+        results = diversify_results(results, game_info_map, genres, systems, top_k)
+    else:
+        results = results[:top_k]
+
+    if not results:
+        print("  Nothing matches those filters. Try relaxing them, or 'clear'.\n")
+        return
+    print_results(results, game_docs, label, relevance=relevance)
+
+
 # ---------------------------------------------------------------------------
 # Load artefacts
 # ---------------------------------------------------------------------------
@@ -302,8 +399,13 @@ def load_artefacts(cfg: dict):
         dict(zip(game_docs["gameid"], game_docs["query_text"]))
         if "query_text" in game_docs.columns else doc_map
     )
-    # author, system, year, tags, rating fields — used by hard filtering and diversity/dedup
-    info_cols = ["author", "system", "year", "tags", "bayesian_avg", "review_count"]
+    # Fields used by hard filtering and diversity/dedup. The `_clean` variants are
+    # what those consumers read; the originals are listed as a fallback for
+    # game_docs files written before the clean/original split. Display reads
+    # game_docs directly, so it always shows the IFDB originals.
+    info_cols = ["author", "author_clean", "system", "system_clean",
+                 "tags", "tags_clean", "genre", "year",
+                 "avg_rating", "bayesian_avg", "review_count"]
     available = [c for c in info_cols if c in game_docs.columns]
     game_info_map: Dict[str, dict] = (
         game_docs.set_index("gameid")[available].to_dict("index")
@@ -351,6 +453,11 @@ def load_artefacts(cfg: dict):
         playedgames_df = pd.read_parquet(played_path)
         logger.info("Loaded playedgames (%d rows)", len(playedgames_df))
 
+    # Precomputed rankings for the enumerable query modes; absent files simply
+    # mean those modes fall back to scoring live.
+    precomputed_user = load_precomputed(data_dir / "precomputed_userid.parquet", "userid")
+    precomputed_game = load_precomputed(data_dir / "precomputed_gameid.parquet", "seed_gameid")
+
     return (
         retriever, reranker, query_encoder,
         game_docs, doc_map, profile_map, name_map,
@@ -358,6 +465,7 @@ def load_artefacts(cfg: dict):
         reviews_df, playedgames_df,
         game_query_text_map,
         game_info_map,
+        precomputed_user, precomputed_game,
     )
 
 
@@ -374,12 +482,17 @@ def run_interactive(
     playedgames_df=None,
     game_query_text_map=None,
     game_info_map=None,
+    precomputed_user=None,
+    precomputed_game=None,
 ) -> None:
+    precomputed_user = precomputed_user or {}
+    precomputed_game = precomputed_game or {}
     retr_cfg        = cfg["retrieval"]
     min_score       = retr_cfg.get("min_retrieval_score", 0.25)
     min_rerank_score = retr_cfg.get("min_rerank_score", 0.25)
-    top_k_ret       = retr_cfg["top_k_retrieve"]
     top_k_rank      = retr_cfg["top_k_rerank"]
+    pool_cap        = retr_cfg.get("rerank_pool_cap", 0)
+    prefilter_tags  = retr_cfg.get("prefilter_by_tag", True)
     rating_w        = retr_cfg.get("rating_weight", 0.5)
     use_diversity   = retr_cfg.get("use_diversity", False)
 
@@ -390,9 +503,9 @@ def run_interactive(
     print("  IFDB Retrieval Demo")
     print("=" * 60)
     print(f"  Query type       : {query_type}")
-    print(f"  Score threshold  : {min_score}  Reranker input: {top_k_ret}  Output: {top_k_rank}")
-    print("  Type 'quit' to exit.")
-    print("  Filters (optional): year:2010-2020; author:emily short; system:inform; tags:fantasy, horror; rating:3.5; count:10\n")
+    print(f"  Score threshold  : {min_score}   Output: {top_k_rank}")
+    print("  Enter a query to see results, then refine them with filters.")
+    print("  Type 'quit' to exit.\n")
 
     game_meta = game_docs.set_index("gameid")
 
@@ -405,12 +518,6 @@ def run_interactive(
             break
         if not query:
             continue
-
-        try:
-            filters_raw = input("Filters > ").strip()
-        except (EOFError, KeyboardInterrupt):
-            break
-        hard_filters = _parse_filters(filters_raw)
 
         seen_games: set = set()
         target_genres: set = set()
@@ -466,43 +573,98 @@ def run_interactive(
             emb = query_encoder.encode([query], normalize_embeddings=True)[0]
             query_text = query
 
-        # Step 1: retrieve all candidates above the score threshold
-        candidates = retriever.index.search(emb, min_score=min_score)
-
-        # Remove seen/query games
-        if query_type == "userid" and seen_games:
-            candidates = [(gid, s) for gid, s in candidates if gid not in seen_games]
+        # userid and game_id draw from a fixed key set, so their rankings are
+        # precomputed offline (scripts/07_precompute.py) and served as a lookup.
+        cached = None
+        if query_type == "userid":
+            cached = precomputed_user.get(query)
         elif query_type == "game_id":
-            candidates = [(gid, s) for gid, s in candidates if gid != query]
+            cached = precomputed_game.get(query)
 
-        # Step 2: apply hard filters
-        if hard_filters and game_info_map is not None:
-            candidates = apply_hard_filters(candidates, game_info_map, **hard_filters)
-            logger.info("After hard filters: %d candidates", len(candidates))
-
-        # Cap to 2 games per author (preserving retrieval order) before truncating
-        if game_info_map is not None:
-            candidates = cap_candidates_by_author(candidates, game_info_map)
-
-        # Step 3: rerank up to top_k_retrieve filtered candidates
-        rerank_candidates = candidates[:top_k_ret]
-        rerank_top_k = len(rerank_candidates) if (use_diversity and (target_genres or target_systems)) else top_k_rank
-        all_scored = reranker.rerank(
-            query_text=query_text,
-            candidates=rerank_candidates,
-            game_doc_lookup=doc_map,
-            top_k=rerank_top_k,
-            bayesian_avg_map=bayesian_avg_map,
-            rating_weight=rating_w,
-            min_ce_score=min_rerank_score,
-        )
-
-        if use_diversity and (target_genres or target_systems) and game_info_map is not None:
-            results = diversify_results(all_scored, game_info_map, target_genres, target_systems, top_k_rank)
+        if cached is not None:
+            gids, scores, rels = cached
+            scored = list(zip(gids, scores))
+            relevance = dict(zip(gids, rels))
+            logger.info("Precomputed ranking (%d entries) — no scoring needed", len(gids))
         else:
-            results = all_scored[:top_k_rank]
+            # Retrieve every candidate above the cosine threshold, then score the
+            # whole pool with the cross-encoder exactly once. Cosine rank and
+            # cross-encoder rank correlate only weakly, so truncating before
+            # reranking would hide most of what the reranker would have chosen —
+            # and would make a filter change which candidates get scored at all.
+            candidates = retriever.index.search(emb, min_score=min_score)
 
-        print_results(results, game_docs, query)
+            # Remove seen/query games
+            if query_type == "userid" and seen_games:
+                candidates = [(gid, s) for gid, s in candidates if gid not in seen_games]
+            elif query_type == "game_id":
+                candidates = [(gid, s) for gid, s in candidates if gid != query]
+
+            if not candidates:
+                print("  No candidates above the retrieval threshold.\n")
+                continue
+
+            # Drop candidates sharing no tag with the query. Measured free, and
+            # far better targeted than truncating by cosine rank.
+            if prefilter_tags and game_info_map is not None:
+                _, query_tags = parse_profile_text(query_text)
+                if query_tags:
+                    before = len(candidates)
+                    candidates = filter_by_tag_overlap(
+                        candidates, game_info_map, set(query_tags)
+                    )
+                    if len(candidates) < before:
+                        logger.info("Tag pre-filter: %d → %d candidates", before, len(candidates))
+
+            # Bound the live cross-encoder cost. Quality plateaus well before this
+            # depth, so the cap trades unused depth for predictable latency.
+            if pool_cap and len(candidates) > pool_cap:
+                logger.info("Capping pool %d → %d for scoring", len(candidates), pool_cap)
+                candidates = candidates[:pool_cap]
+
+            logger.info("Scoring %d candidates with the reranker …", len(candidates))
+            scored, relevance = reranker.rerank(
+                query_text=query_text,
+                candidates=candidates,
+                game_doc_lookup=doc_map,
+                top_k=len(candidates),
+                bayesian_avg_map=bayesian_avg_map,
+                rating_weight=rating_w,
+                min_ce_score=min_rerank_score,
+            )
+
+        render = lambda flt: show_results(
+            scored, flt,
+            game_docs=game_docs, game_info_map=game_info_map, top_k=top_k_rank,
+            use_diversity=use_diversity, target_genres=target_genres,
+            target_systems=target_systems, label=query, relevance=relevance,
+        )
+        render({})
+
+        # Refine loop: filters are applied to the cached ranking above, so
+        # they narrow these results instead of triggering a fresh search.
+        print(FILTER_HELP)
+        while True:
+            try:
+                raw = input("Filter > ").strip()
+            except (EOFError, KeyboardInterrupt):
+                return
+            command = raw.lower()
+            if command in ("back", "b"):
+                break
+            if command in ("quit", "exit", "q"):
+                return
+            if command in ("help", "?"):
+                print(FILTER_HELP)
+                continue
+            if command in ("", "clear", "reset"):
+                render({})
+                continue
+            hard_filters = _parse_filters(raw)
+            if not hard_filters:
+                print("  Could not read that. Filters look like 'rating:3.5; year:2020-2026'.")
+                continue
+            render(hard_filters)
 
 
 # ---------------------------------------------------------------------------
@@ -513,10 +675,16 @@ def run_evaluation(
     retriever,
     game_docs, doc_map,
     cfg,
+    reranker=None,
+    profile_map=None,
+    bayesian_avg_map=None,
+    rerank: bool = False,
 ) -> None:
     data_dir   = Path(cfg["paths"]["data_dir"])
     retr_cfg   = cfg["retrieval"]
     top_k_ret  = retr_cfg["top_k_retrieve"]
+    min_score  = retr_cfg.get("min_retrieval_score", 0.25)
+    profile_map = profile_map or {}
 
     logger.info("Loading test interactions …")
     interactions = pd.read_parquet(data_dir / "interactions.parquet")
@@ -528,16 +696,34 @@ def run_evaluation(
         test_pos.groupby("userid")["gameid"].apply(set).to_dict()
     )
 
-    logger.info("Running retrieval for %d test users …", len(ground_truth))
+    mode = "retrieval + reranking" if rerank else "raw retrieval"
+    logger.info("Running %s for %d test users …", mode, len(ground_truth))
     predictions: Dict[str, List[str]] = {}
     n_skipped = 0
-    for uid in ground_truth:
+    for n, uid in enumerate(ground_truth, start=1):
         emb = retriever._encode_userid(uid)
         if emb is None:
             n_skipped += 1
             continue
-        candidates = retriever.index.search(emb, top_k=top_k_ret)
-        predictions[uid] = [gid for gid, _ in candidates]
+        if rerank:
+            # Mirror the interactive path: score every candidate above the
+            # cosine threshold, so the measurement reflects what users see.
+            candidates = retriever.index.search(emb, min_score=min_score)
+            scored, _ = reranker.rerank(
+                query_text=profile_map.get(uid, ""),
+                candidates=candidates,
+                game_doc_lookup=doc_map,
+                top_k=len(candidates),
+                bayesian_avg_map=bayesian_avg_map,
+                rating_weight=retr_cfg.get("rating_weight", 0.5),
+                min_ce_score=retr_cfg.get("min_rerank_score", 0.25),
+            )
+            predictions[uid] = [gid for gid, _ in scored]
+        else:
+            candidates = retriever.index.search(emb, top_k=top_k_ret)
+            predictions[uid] = [gid for gid, _ in candidates]
+        if rerank and n % 100 == 0:
+            logger.info("  %d/%d users scored", n, len(ground_truth))
 
     if n_skipped:
         logger.warning("%d test users had no profile and were skipped", n_skipped)
@@ -549,7 +735,7 @@ def run_evaluation(
     )
 
     print("\n" + "=" * 50)
-    print("  Evaluation results (test split)")
+    print(f"  Evaluation results (test split, {mode})")
     print("=" * 50)
     for metric, value in sorted(results.items()):
         print(f"  {metric:<15}  {value:.4f}")
@@ -567,6 +753,9 @@ def main() -> None:
                         choices=["interactive", "evaluate"])
     parser.add_argument("--query-type", default="text",
                         choices=["text", "userid", "game_id"])
+    parser.add_argument("--rerank", action="store_true",
+                        help="Evaluate mode: score candidates with the reranker, "
+                             "as the interactive pipeline does (slower)")
     args = parser.parse_args()
 
     with open(args.config) as f:
@@ -579,6 +768,7 @@ def main() -> None:
         reviews_df, playedgames_df,
         game_query_text_map,
         game_info_map,
+        precomputed_user, precomputed_game,
     ) = load_artefacts(cfg)
 
     if args.mode == "interactive":
@@ -591,9 +781,15 @@ def main() -> None:
             playedgames_df=playedgames_df,
             game_query_text_map=game_query_text_map,
             game_info_map=game_info_map,
+            precomputed_user=precomputed_user,
+            precomputed_game=precomputed_game,
         )
     else:
-        run_evaluation(retriever, game_docs, doc_map, cfg)
+        run_evaluation(
+            retriever, game_docs, doc_map, cfg,
+            reranker=reranker, profile_map=profile_map,
+            bayesian_avg_map=bayesian_avg_map, rerank=args.rerank,
+        )
 
 
 if __name__ == "__main__":
