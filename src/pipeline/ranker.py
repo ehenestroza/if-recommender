@@ -94,6 +94,39 @@ class Reranker:
 # Post-rerank diversity
 # ---------------------------------------------------------------------------
 
+def select_results(
+    scored: List[Tuple[str, float]],
+    hard_filters: Optional[dict],
+    game_info_map: Optional[Dict[str, dict]],
+    top_k: int,
+    use_diversity: bool = True,
+    target_genres: Optional[set] = None,
+    target_systems: Optional[set] = None,
+) -> List[Tuple[str, float]]:
+    """
+    Turn a scored candidate pool into the final page: filter, then diversify.
+
+    Shared by the CLI and the web app so the two cannot drift apart — the order
+    of these steps is load-bearing (filtering before diversification is what lets
+    an `author:` filter disable the variety cap).
+    """
+    from src.pipeline.retriever import apply_hard_filters  # local: avoids a cycle
+
+    results = scored
+    if hard_filters and game_info_map is not None:
+        results = apply_hard_filters(results, game_info_map, **hard_filters)
+
+    if game_info_map is None:
+        return results[:top_k]
+
+    genres = (target_genres or set()) if use_diversity else set()
+    systems = (target_systems or set()) if use_diversity else set()
+    return diversify_results(
+        results, game_info_map, genres, systems, top_k,
+        cap_authors="author" not in (hard_filters or {}),
+    )
+
+
 def _game_genres(game_info_map: Dict[str, dict], gid: str) -> set:
     return {g.strip() for g in str(game_info_map.get(gid, {}).get("genre", "")).split(",") if g.strip()}
 
@@ -126,12 +159,22 @@ def diversify_results(
     target_systems: set,
     top_k: int,
     max_author_appearances: int = 2,
+    cap_authors: bool = True,
 ) -> List[Tuple[str, float]]:
     """
     Select top_k from a fully scored + sorted candidate list with two passes:
 
-    1. Deduplication — a candidate is dropped if adding it would cause any individual
-       author to appear more than max_author_appearances times across the selected results.
+    1. Author variety — a candidate is set aside if adding it would let one author
+       appear more than max_author_appearances times, so a prolific author cannot
+       fill the page. The cap yields in two situations where it would work against
+       the user:
+
+         * `cap_authors=False` — the caller filtered *by* author, so wanting more
+           than two of their games is the entire point of the request.
+         * Too few results — if the cap leaves fewer than top_k, the highest-scored
+           set-aside candidates are added back until the page is full. Variety the
+           user can see is worth less than the slots they asked for.
+
     2. Coverage — if the initial top_k misses a target genre or system,
        the highest-scored remaining candidate covering that target is swapped
        in, displacing the lowest-scoring initial item.
@@ -141,18 +184,31 @@ def diversify_results(
                     normalised `_clean` variants, matching the profile-derived targets
     target_genres:  genre strings to aim to cover (from user profile or seed game)
     target_systems: system strings to aim to cover
+    cap_authors:    False to disable the variety cap entirely
     """
-    # Pass 1: deduplicate — skip if any individual author would exceed max_author_appearances.
+    # Pass 1: author variety. Overflow is kept rather than discarded so it can
+    # backfill a short page.
     deduped: List[Tuple[str, float]] = []
-    author_counts: Dict[str, int] = {}
-    for gid, score in candidates:
-        info = game_info_map.get(gid, {})
-        game_authors = split_clean(info, "author")
-        if any(author_counts.get(a, 0) >= max_author_appearances for a in game_authors):
-            continue
-        deduped.append((gid, score))
-        for a in game_authors:
-            author_counts[a] = author_counts.get(a, 0) + 1
+    overflow: List[Tuple[str, float]] = []
+    if not cap_authors:
+        deduped = list(candidates)
+    else:
+        author_counts: Dict[str, int] = {}
+        for gid, score in candidates:
+            info = game_info_map.get(gid, {})
+            game_authors = split_clean(info, "author")
+            if any(author_counts.get(a, 0) >= max_author_appearances for a in game_authors):
+                overflow.append((gid, score))
+                continue
+            deduped.append((gid, score))
+            for a in game_authors:
+                author_counts[a] = author_counts.get(a, 0) + 1
+
+        if len(deduped) < top_k and overflow:
+            shortfall = top_k - len(deduped)
+            logger.debug("Author cap left %d of %d slots; backfilling %d",
+                         len(deduped), top_k, min(shortfall, len(overflow)))
+            deduped = sorted(deduped + overflow[:shortfall], key=lambda pair: -pair[1])
 
     if not target_genres and not target_systems:
         return deduped[:top_k]

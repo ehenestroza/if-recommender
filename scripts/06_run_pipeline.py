@@ -40,8 +40,12 @@ from sentence_transformers import SentenceTransformer, CrossEncoder
 
 from src.index.faiss_index import GameIndex
 from src.pipeline.retriever import Retriever
-from src.data.preprocessor import parse_profile_text
-from src.pipeline.ranker import Reranker, evaluate_retrieval, diversify_results
+from src.data.preprocessor import (
+    SYSTEM_GENRE_SEPARATORS, TAG_SEPARATORS,
+    build_author_profiles, build_display_map, format_display,
+    author_game_map, parse_profile_text,
+)
+from src.pipeline.ranker import Reranker, evaluate_retrieval, select_results
 from src.pipeline.retriever import apply_hard_filters, filter_by_tag_overlap
 
 logger = logging.getLogger(__name__)
@@ -100,8 +104,11 @@ def _game_row_cells(
         str(row.get("title", gid)),
         str(row.get("author", "")),
         str(row.get("year", "")),
-        str(row.get("system", "")),
-        str(row.get("tags", "")),
+        str(row.get("system_display", row.get("system", ""))),
+        str(row.get("genre_display", row.get("genre", ""))),
+        # *_display columns are added at load time: deduplicated, canonically cased,
+        # ordered by how many games use each tag.
+        str(row.get("tags_display", row.get("tags", ""))),
         "–" if rel is None else f"{rel:.2f}",
         _rating_cell(row),
     )
@@ -110,10 +117,11 @@ def _game_row_cells(
 def _add_game_columns(table) -> None:
     """Add standard game columns to a Rich table."""
     table.add_column("Score",  style="cyan",       width=8)
-    table.add_column("Title",  style="bold white",  min_width=30)
+    table.add_column("Title",  style="bold white",  min_width=24)
     table.add_column("Author", style="yellow")
     table.add_column("Year",   style="dim",         width=6)
     table.add_column("System", style="blue")
+    table.add_column("Genre",  style="cyan")
     table.add_column("Tags",   style="violet")
     # The two components of Score, shown so their trade-off is visible.
     table.add_column("Relev.", style="green",      width=6)
@@ -211,6 +219,7 @@ def print_rated_games(
         table.add_column("Author", style="yellow")
         table.add_column("Year",   style="dim",        width=6)
         table.add_column("System", style="blue")
+        table.add_column("Genre",  style="cyan")
         table.add_column("Tags",   style="violet")
         for gid, rating in rated:
             row: dict = meta.loc[gid].to_dict() if gid in meta.index else {}
@@ -219,8 +228,9 @@ def print_rated_games(
                 str(row.get("title", gid)),
                 str(row.get("author", "")),
                 str(row.get("year", "")),
-                str(row.get("system", "")),
-                str(row.get("tags", "")),
+                str(row.get("system_display", row.get("system", ""))),
+                str(row.get("genre_display", row.get("genre", ""))),
+                str(row.get("tags_display", row.get("tags", ""))),
             )
         console.print(table)
     else:
@@ -266,7 +276,9 @@ def _parse_filters(raw: str) -> dict:
             continue
         key, _, val = part.partition(":")
         key = key.strip().lower()
-        val = val.strip()
+        # Multi-word values work unquoted ("tags:slice of life"), but people
+        # reasonably try quoting them, so accept and discard the quotes.
+        val = val.strip().strip('"').strip("'").strip()
         if not val:
             continue
         if key in ("year", "year_range"):
@@ -277,6 +289,8 @@ def _parse_filters(raw: str) -> dict:
             filters["system"] = val
         elif key in ("tag", "tags"):
             filters["tags"] = val
+        elif key == "genre":
+            filters["genre"] = val
         elif key in ("min_rating", "rating"):
             try:
                 filters["min_rating"] = float(val)
@@ -299,7 +313,14 @@ def load_precomputed(path: Path, key_col: str) -> dict:
     """
     if not path.exists():
         return {}
-    frame = pd.read_parquet(path)
+    try:
+        frame = pd.read_parquet(path)
+    except Exception as exc:
+        # A precompute in progress, or a half-written file from a failed run.
+        # Falling back to live scoring is always correct, just slower.
+        logger.warning("Ignoring unreadable %s (%s) — scoring live instead",
+                       path.name, type(exc).__name__)
+        return {}
     table = {
         key: (grp["gameid"].tolist(), grp["score"].to_numpy(), grp["relevance"].to_numpy())
         for key, grp in frame.groupby(key_col, sort=False)
@@ -309,7 +330,8 @@ def load_precomputed(path: Path, key_col: str) -> dict:
 
 
 FILTER_HELP = """  Refine these results with filters, e.g.  year:2020-2026; rating:3.5; count:2
-  Keys: year, author, system, tags, rating, count   (each entry replaces the last)
+  Keys: year, author, system, tags, genre, rating, count   (each entry replaces the last)
+  Values match what the results show, e.g.  tags:IFComp 2025  ·  system:Inform 7
   'clear' show all again  ·  'back' new query  ·  'quit' exit"""
 
 
@@ -333,19 +355,13 @@ def show_results(
     narrows what the user is already looking at rather than changing which
     candidates ever reached the reranker.
     """
-    results = scored
-    if hard_filters and game_info_map is not None:
-        results = apply_hard_filters(results, game_info_map, **hard_filters)
+    results = select_results(
+        scored, hard_filters, game_info_map, top_k,
+        use_diversity=use_diversity,
+        target_genres=target_genres, target_systems=target_systems,
+    )
+    if hard_filters:
         logger.info("Filters kept %d of %d scored candidates", len(results), len(scored))
-
-    if game_info_map is not None:
-        # diversify_results caps repeat authors even with no coverage targets,
-        # which is why no separate author-cap pass is needed before reranking.
-        genres = target_genres if use_diversity else set()
-        systems = target_systems if use_diversity else set()
-        results = diversify_results(results, game_info_map, genres, systems, top_k)
-    else:
-        results = results[:top_k]
 
     if not results:
         print("  Nothing matches those filters. Try relaxing them, or 'clear'.\n")
@@ -387,6 +403,21 @@ def load_artefacts(cfg: dict):
 
     logger.info("Loading game docs and user profiles …")
     game_docs     = pd.read_parquet(data_dir / "game_docs_retrieval.parquet")
+
+    # Precompute the display form of each free-text field once, rather than
+    # reformatting on every render. System and genre also split on "/", which
+    # IFDB uses inconsistently ("Drama / Political").
+    for column, separators in (
+        ("tags", TAG_SEPARATORS),
+        ("system", SYSTEM_GENRE_SEPARATORS),
+        ("genre", SYSTEM_GENRE_SEPARATORS),
+    ):
+        if column not in game_docs.columns:
+            continue
+        display_map = build_display_map(game_docs, column, separators)
+        game_docs[f"{column}_display"] = game_docs[column].apply(
+            lambda raw, m=display_map, s=separators: format_display(raw, m, s)
+        )
     user_profiles = pd.read_parquet(data_dir / "user_profiles_retrieval.parquet")
 
     doc_map     = dict(zip(game_docs["gameid"],     game_docs["doc_text"]))
@@ -453,10 +484,19 @@ def load_artefacts(cfg: dict):
         playedgames_df = pd.read_parquet(played_path)
         logger.info("Loaded playedgames (%d rows)", len(playedgames_df))
 
+    # Author profiles: same shape as user profiles, aggregated over the games an
+    # author wrote. Derived from game_docs, so no separate artefact to keep in sync.
+    author_profiles = build_author_profiles(game_docs)
+    author_profile_map = dict(zip(author_profiles["authorid"], author_profiles["profile_text"]))
+    author_name_map = dict(zip(author_profiles["authorid"], author_profiles["name"]))
+    author_games = author_game_map(game_docs)
+    logger.info("Built %d author profiles", len(author_profile_map))
+
     # Precomputed rankings for the enumerable query modes; absent files simply
     # mean those modes fall back to scoring live.
     precomputed_user = load_precomputed(data_dir / "precomputed_userid.parquet", "userid")
     precomputed_game = load_precomputed(data_dir / "precomputed_gameid.parquet", "seed_gameid")
+    precomputed_author = load_precomputed(data_dir / "precomputed_authorid.parquet", "authorid")
 
     return (
         retriever, reranker, query_encoder,
@@ -465,7 +505,8 @@ def load_artefacts(cfg: dict):
         reviews_df, playedgames_df,
         game_query_text_map,
         game_info_map,
-        precomputed_user, precomputed_game,
+        precomputed_user, precomputed_game, precomputed_author,
+        author_profile_map, author_name_map, author_games,
     )
 
 
@@ -484,9 +525,17 @@ def run_interactive(
     game_info_map=None,
     precomputed_user=None,
     precomputed_game=None,
+    precomputed_author=None,
+    author_profile_map=None,
+    author_name_map=None,
+    author_games=None,
 ) -> None:
     precomputed_user = precomputed_user or {}
     precomputed_game = precomputed_game or {}
+    precomputed_author = precomputed_author or {}
+    author_profile_map = author_profile_map or {}
+    author_name_map = author_name_map or {}
+    author_games = author_games or {}
     retr_cfg        = cfg["retrieval"]
     min_score       = retr_cfg.get("min_retrieval_score", 0.25)
     min_rerank_score = retr_cfg.get("min_rerank_score", 0.25)
@@ -569,6 +618,22 @@ def run_interactive(
             target_genres, target_systems = _parse_profile_targets(query_text)
             target_systems = set(list(target_systems)[:1])
 
+        elif query_type == "author_id":
+            # Author names are the key; match case-insensitively so the user can
+            # type them as they appear in the results table.
+            key = query.strip().lower()
+            if key not in author_profile_map:
+                print(f"  No profile for author '{query}' — "
+                      f"{len(author_profile_map)} authors available")
+                continue
+            query_text = author_profile_map[key]
+            print_user_profile(author_name_map.get(key, query), query_text,
+                               user_name=f"{len(author_games.get(key, []))} games")
+            emb = query_encoder.encode([query_text], normalize_embeddings=True)[0]
+            # Suppress the author's own catalogue, as game_id suppresses its seed.
+            seen_games = set(author_games.get(key, []))
+            target_genres, target_systems = _parse_profile_targets(query_text)
+
         else:  # text — no structured targets, diversity is a no-op
             emb = query_encoder.encode([query], normalize_embeddings=True)[0]
             query_text = query
@@ -580,6 +645,8 @@ def run_interactive(
             cached = precomputed_user.get(query)
         elif query_type == "game_id":
             cached = precomputed_game.get(query)
+        elif query_type == "author_id":
+            cached = precomputed_author.get(query.strip().lower())
 
         if cached is not None:
             gids, scores, rels = cached
@@ -595,7 +662,7 @@ def run_interactive(
             candidates = retriever.index.search(emb, min_score=min_score)
 
             # Remove seen/query games
-            if query_type == "userid" and seen_games:
+            if query_type in ("userid", "author_id") and seen_games:
                 candidates = [(gid, s) for gid, s in candidates if gid not in seen_games]
             elif query_type == "game_id":
                 candidates = [(gid, s) for gid, s in candidates if gid != query]
@@ -752,7 +819,7 @@ def main() -> None:
     parser.add_argument("--mode",       default="interactive",
                         choices=["interactive", "evaluate"])
     parser.add_argument("--query-type", default="text",
-                        choices=["text", "userid", "game_id"])
+                        choices=["text", "userid", "game_id", "author_id"])
     parser.add_argument("--rerank", action="store_true",
                         help="Evaluate mode: score candidates with the reranker, "
                              "as the interactive pipeline does (slower)")
@@ -768,7 +835,8 @@ def main() -> None:
         reviews_df, playedgames_df,
         game_query_text_map,
         game_info_map,
-        precomputed_user, precomputed_game,
+        precomputed_user, precomputed_game, precomputed_author,
+        author_profile_map, author_name_map, author_games,
     ) = load_artefacts(cfg)
 
     if args.mode == "interactive":
@@ -783,6 +851,10 @@ def main() -> None:
             game_info_map=game_info_map,
             precomputed_user=precomputed_user,
             precomputed_game=precomputed_game,
+            precomputed_author=precomputed_author,
+            author_profile_map=author_profile_map,
+            author_name_map=author_name_map,
+            author_games=author_games,
         )
     else:
         run_evaluation(

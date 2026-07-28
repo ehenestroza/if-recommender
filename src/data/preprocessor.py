@@ -41,6 +41,138 @@ def format_profile_text(systems: List[str], tags: List[str]) -> str:
     return ". ".join(parts)
 
 
+# Tags may legitimately contain a slash ("gay/queer protagonist"), so they split
+# on commas only. System and genre use both, since IFDB stores values like
+# "Drama / Political" and "Ink / HTML5".
+TAG_SEPARATORS = re.compile(r",")
+# Authors are also joined with " and ".
+AUTHOR_SEPARATORS = re.compile(r"\s*/\s*|\s*,\s*|\s+and\s+")
+SYSTEM_GENRE_SEPARATORS = re.compile(r"[,/]")
+
+
+def build_display_map(
+    game_docs: pd.DataFrame,
+    column: str,
+    separators: re.Pattern = TAG_SEPARATORS,
+) -> Dict[str, Tuple[str, int]]:
+    """
+    Map each value in `column` (lowercased) to its dominant casing and game count.
+
+        "ifcomp 2025" -> ("IFComp 2025", 84)
+        "dendry"      -> ("Dendry", 41)
+
+    IFDB fields are free text, so the same value appears in many casings and with
+    inconsistent separators. Showing whichever form a given game happened to
+    store makes a column look ragged; showing the community's dominant casing
+    makes it look edited.
+    """
+    casings: Dict[str, Counter] = {}
+    game_counts: Counter = Counter()
+    for value in game_docs.get(column, pd.Series(dtype=str)).fillna(""):
+        seen_here = set()
+        for raw in separators.split(str(value)):
+            item = raw.strip()
+            if not item:
+                continue
+            key = item.lower()
+            casings.setdefault(key, Counter())[item] += 1
+            if key not in seen_here:          # count games, not occurrences
+                game_counts[key] += 1
+                seen_here.add(key)
+    # Tie-break on the casing itself so the choice is stable across runs.
+    return {
+        key: (min(counter.items(), key=lambda kv: (-kv[1], kv[0]))[0], game_counts[key])
+        for key, counter in casings.items()
+    }
+
+
+def format_display(
+    raw: str,
+    display_map: Dict[str, Tuple[str, int]],
+    separators: re.Pattern = TAG_SEPARATORS,
+) -> str:
+    """
+    Render one field for display: split, deduplicated, canonically cased, and
+    ordered by how widely each value is used, most common first.
+
+    Popularity ordering puts the values that situate a game — "fantasy",
+    "parser" — ahead of the long tail of one-off entries, which is what a reader
+    scanning a truncated column wants to see first. Output is always
+    comma-separated, so slash-delimited source values are normalised too.
+    """
+    chosen: Dict[str, Tuple[str, int]] = {}
+    for part in separators.split(str(raw or "")):
+        item = part.strip()
+        if not item:
+            continue
+        key = item.lower()
+        if key not in chosen:
+            chosen[key] = display_map.get(key, (item, 0))
+    ordered = sorted(chosen.values(), key=lambda pair: (-pair[1], pair[0].lower()))
+    return ", ".join(display for display, _ in ordered)
+
+
+def author_game_map(game_docs: pd.DataFrame) -> Dict[str, List[str]]:
+    """Map each individual author (lowercased) to the games they wrote."""
+    games: Dict[str, List[str]] = {}
+    author_col = clean_col_in(game_docs.columns, "author")
+    for gid, authors in zip(game_docs["gameid"], game_docs[author_col].fillna("")):
+        # author_clean is already split into individual people and rejoined.
+        for name in {a.strip().lower() for a in str(authors).split(",") if a.strip()}:
+            games.setdefault(name, []).append(gid)
+    return games
+
+
+def build_author_profiles(
+    game_docs: pd.DataFrame,
+    min_games: int = 1,
+    n_systems: int = 3,
+    n_tags: int = _MAX_TAGS,
+) -> pd.DataFrame:
+    """
+    Build a taste profile for each author from the games they wrote.
+
+    Structurally identical to a user profile — top systems and tags in the same
+    `format_profile_text` shape — but aggregated over an author's own catalogue
+    rather than the games a user rated highly. That makes "recommend me something
+    like this author" just another profile query, using the same encoders.
+
+    Single-game authors are included by default. Their profile is effectively
+    that game's `query_text`, so results resemble `game_id` mode for that game —
+    but a user picking an author has no idea how many games they wrote, and
+    being told to switch modes and find a game ID would be a poor answer.
+
+    Returns columns: authorid, name, game_count, profile_text.
+    """
+    games = author_game_map(game_docs)
+    casings = build_display_map(game_docs, "author", AUTHOR_SEPARATORS)
+    systems_by_game = dict(zip(game_docs["gameid"], game_docs[clean_col("system")].fillna("")))
+    tags_by_game = dict(zip(game_docs["gameid"], game_docs[clean_col("tags")].fillna("")))
+
+    rows: List[dict] = []
+    for key, gids in games.items():
+        if len(gids) < min_games:
+            continue
+        systems: Counter = Counter()
+        tags: Counter = Counter()
+        for gid in gids:
+            systems.update(v.strip() for v in str(systems_by_game.get(gid, "")).split(",") if v.strip())
+            tags.update(v.strip() for v in str(tags_by_game.get(gid, "")).split(",") if v.strip())
+        profile_text = format_profile_text(
+            [s for s, _ in systems.most_common(n_systems)],
+            [t for t, _ in tags.most_common(n_tags)],
+        )
+        if not profile_text:
+            continue
+        rows.append({
+            "authorid": key,
+            "name": casings.get(key, (key, 0))[0],
+            "game_count": len(gids),
+            "profile_text": profile_text,
+        })
+    return pd.DataFrame(rows).sort_values("game_count", ascending=False).reset_index(drop=True)
+
+
 def parse_profile_text(text: str) -> Tuple[List[str], List[str]]:
     """Inverse of `format_profile_text` — recover (systems, tags) from a query."""
     systems: List[str] = []

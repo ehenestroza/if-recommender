@@ -1,6 +1,6 @@
 # IFDB Interactive Fiction Recommender
 
-A full retrieval-and-ranking pipeline built on the [IFDB](https://ifdb.org) Interactive Fiction Database. Community ratings drive training of an **asymmetric two-tower bi-encoder** for candidate retrieval, followed by a fine-tuned **cross-encoder reranker**, indexed via **FAISS**. The system supports structured system/tag queries, user-based personalised recommendations, and "more like this" seed-game queries, with optional hard filters and post-rerank diversity enforcement.
+A full retrieval-and-ranking pipeline built on the [IFDB](https://ifdb.org) Interactive Fiction Database. Community ratings drive training of an **asymmetric two-tower bi-encoder** for candidate retrieval, followed by a fine-tuned **cross-encoder reranker**, indexed via **FAISS**. Four ways in — by game, by author, by reviewer, or by picking systems and tags — with hard filters and post-rerank diversity. Ships with a Gradio app; the three enumerable modes are precomputed and served as lookups.
 
 ---
 
@@ -100,6 +100,7 @@ Both run on the scored list, so an author's *best* games survive the cap rather 
 
 ```
 if-recommender/
+├── app.py                        # Gradio front-end
 ├── config.yaml                   # All tunable parameters
 ├── pyproject.toml / uv.lock
 │
@@ -115,7 +116,7 @@ if-recommender/
 │   ├── data/
 │   │   ├── columns.py            # Original vs. `_clean` column naming convention
 │   │   ├── loader.py             # MySQL → Parquet extraction
-│   │   ├── preprocessor.py       # Game docs, user profiles, interactions, splits
+│   │   ├── preprocessor.py       # Game docs, user/author profiles, display normalisation, splits
 │   │   └── dataset.py            # PairDataset for bi-encoder training
 │   ├── index/
 │   │   └── faiss_index.py        # GameIndex: build / search / save / load
@@ -132,7 +133,7 @@ if-recommender/
     ├── 04_train_reranker.py      # Fine-tune cross-encoder reranker
     ├── 05_build_index.py         # Encode all games → FAISS index + embedding files
     ├── 06_run_pipeline.py        # Interactive demo + offline evaluation
-    └── 07_precompute.py          # Precompute userid / game_id rankings for deployment
+    └── 07_precompute.py          # Precompute userid / game_id / author_id rankings
 ```
 
 ---
@@ -179,8 +180,14 @@ uv run scripts/05_build_index.py
 # 6a. Offline evaluation on the test split
 uv run scripts/06_run_pipeline.py --mode evaluate
 
-# 6b. Interactive demo
+# 6b. Interactive demo (terminal)
 uv run scripts/06_run_pipeline.py
+
+# 7. Precompute rankings for the lookup-served modes (~5 h)
+uv run scripts/07_precompute.py --mode all --top-n 500
+
+# 8. Web app
+python app.py
 ```
 
 ---
@@ -244,7 +251,8 @@ The interactive demo supports three query types (selected at startup via `--quer
 |---|---|---|
 | `text` (default) | `"Systems: twine. Tags: fantasy, slice of life, choice-based, graphics"` | Recommendations based on formatted text in the style of a user taste profile, which should include "Systems:" and "Tags:" lists. |
 | `userid` | `"9rwstoqhvjcff8hf"` | Personalised recommendations from a user profile based on the user's positive rating history |
-| `game_id` | a game ID string | "More like this" recomendations based on the seed game's profile |
+| `game_id` | a game ID string | "More like this" recommendations based on the seed game's profile |
+| `author_id` | an author name | Games in the spirit of an author's catalogue, with their own games excluded |
 
 ```bash
 uv run scripts/06_run_pipeline.py --query-type userid
@@ -287,22 +295,28 @@ The practical consequence is that scores mean the same thing across refinements.
 
 ### Hard filters
 
-After entering a query, an optional `Filters >` prompt appears and accepts semicolon-separated constraints. All filters are AND-ed together and applied before the reranker:
+Filters narrow the ranking you are already looking at. They are AND-ed together and applied after scoring, so they never change which candidates were ranked.
 
-| Key | Example | Behaviour |
+| Key | Example | Matches against |
 |---|---|---|
-| `year` | `year:2010-2020` | Publication year within range (inclusive) |
-| `author` | `author:emily short` | Substring match against any individual author name |
-| `system` | `system:inform` | Substring match against any individual system name |
-| `tags` | `tags:fantasy, horror` | All listed tags must be present in the game's tag set |
-| `rating` | `rating:3.5` | Community average rating ≥ value; unrated games excluded |
-| `count` | `count:10` | Number of ratings ≥ value |
+| `year` | `year:2010-2020` | Publication year, inclusive |
+| `author` | `author:emily short` | Any individual author name |
+| `system` | `system:inform` | Any individual system name |
+| `genre` | `genre:horror` | Any genre value |
+| `tags` | `tags:IFComp 2025` | Game tags; each listed tag must match |
+| `rating` | `rating:3.5` | Raw community average; unrated games excluded |
+| `count` | `count:10` | Number of ratings |
 
-Press Enter to skip filtering.
+**Filters match the original IFDB values, not the normalised `_clean` ones**, so a filter only ever matches something visible in the results. Two consequences motivated that:
 
-`rating` compares against the raw community average, not `bayesian_avg`. Smoothing pulls low-review games toward a 3.5 prior, so filtering on it would return games whose actual average sits below what was asked for — and would admit unrated games on the strength of the prior alone. The results table shows that same raw average, with `—` for games nobody has rated.
+- `tags:IFComp 2025` works. Competition tags are stripped from `tags_clean`, so filtering the cleaned values could never match them.
+- `tags:slice of life` no longer returns games that merely have *genre* "Slice of life". Genre is folded into `tags_clean` but is not shown in the tags column, which made those look like false positives. Use `genre:` for that field.
 
-The trade-off is that a single 5★ review now reads as 5.0 and clears any threshold; pair `rating:` with `count:` when you want a floor backed by a meaningful sample. `bayesian_avg` is still what the reranker blends into its score, where shrinking sparse ratings toward the mean is the point.
+Matching is case-insensitive and by substring, so `system:inform` finds `Inform 7` and `tags:xyzzy` finds all 44 XYZZY tags. Quotes are accepted and ignored.
+
+`rating` compares the raw community average rather than `bayesian_avg`. Smoothing pulls low-review games toward a 3.5 prior, so filtering on it would return games whose actual average is below what was asked for, and would admit unrated games on the strength of the prior alone. The results table shows that same raw average, with `—` for unrated games.
+
+The trade-off: a single 5★ review reads as 5.0 and clears any threshold. Pair `rating:` with `count:` for a floor backed by a real sample.
 
 ---
 
@@ -339,6 +353,25 @@ So originals keep their own names and every normalised variant is written beside
 
 One deliberate exception: the **User Profile** panel shows normalised text, because it *is* the encoder input — it shows what was actually searched for, not an IFDB record.
 
+### Author profiles
+
+Each author gets a profile in the same shape, aggregated over the games they wrote rather than the games a user rated. That makes "something in this author's spirit" just another profile query through the same encoders, with their own catalogue excluded from results.
+
+Single-game authors are included: their profile is byte-identical to that game's `query_text` for 4,711 of 4,713 cases, so the mode duplicates `game_id` for them — which is the point. Someone picking an author has no idea how many games they wrote, and being told to switch modes and look up a game ID would be a poor answer.
+
+### Display normalisation
+
+IFDB's free-text fields are inconsistent: the same tag appears in many casings, systems and genres use both commas and slashes as separators, and values repeat within one field. Before display, each of `tags`, `system` and `genre` is split, deduplicated, mapped to the community's dominant casing, and ordered by how many games use each value.
+
+```
+Educational, Slice of life   ->  Slice of life, Educational      (640 games vs 135)
+Fantasy, mystery, romance    ->  Fantasy, Mystery, Romance
+Drama / Political            ->  Drama, Political
+dendry                       ->  Dendry
+```
+
+Tags split on commas only — `gay/queer protagonist` is a single tag — while systems and genres split on both. This is presentation only: filters still match the stored values, so a filter never misses a game because its casing differs from the canonical form.
+
 ### User profiles
 
 Each user's profile text is built by aggregating system and tag values from their positively-rated games (relative-positive interactions + any game rated ≥ 4★ absolutely). Format: `"Systems: X, Y. Tags: a, b, c, …"` — up to 3 systems and 20 tags, ranked by frequency. Two profile sets are built: one from training-split positives only (for training), and a broader one from all positive interactions (for retrieval serving).
@@ -362,9 +395,11 @@ training:
 
 retrieval:
   min_retrieval_score: 0.25      # cosine similarity threshold for initial candidate set
-  min_rerank_score: 0.30         # relevance floor; nothing below it reaches the top 10 anyway
+  min_rerank_score: 0.10         # relevance floor; low enough for filter headroom, high enough to display
   top_k_retrieve: 50             # raw-retrieval evaluation only — the pipeline reranks the whole pool
-  top_k_rerank: 25               # final output size
+  top_k_rerank: 25               # results per page
+  rerank_pool_cap: 0             # max candidates scored live; 0 = no cap
+  prefilter_by_tag: true         # drop candidates sharing no tag with the query (measured free)
   use_rating_reranking: true     # blend bayesian_avg rating into final score
   rating_weight: 0.5             # weight on bayesian_avg/5; 0.3-0.5 equivalent, above 0.5 hurts
   use_diversity: true            # enforce system coverage and author cap in output
@@ -463,42 +498,70 @@ Against the April run (raw retrieval: MRR 0.2586, Recall@10 0.3661, NDCG@10 0.27
 
 ---
 
+## Web app
+
+```bash
+python app.py
+```
+
+A Gradio front-end with four entry points, styled as a terminal to suit the audience. Pick a search type, optionally narrow with filters, and page through results.
+
+| Search type | Picker shows | Served from |
+|---|---|---|
+| game | `Title — Author (Year)`, 10,087 | precomputed |
+| author | name and game count, 6,298 | precomputed |
+| user | name and review count, 3,175 | precomputed |
+| browse | systems and tags, multi-select | scored live, cached |
+
+Pickers are typeaheads ordered by frequency, so opening one cold shows the most common entries first. Games carry author and year because 119 titles are shared by up to five different games — a bare title would make all but one unreachable.
+
+Result titles link to `ifdb.org/viewgame?id=…`. The `genre`, `system`, `author` and `tags` filters accept free text as well as menu choices, so typing `xyzzy` and pressing return matches all 44 XYZZY tags by substring.
+
+Three author entries are hidden from the *search* picker — both `Anonymous` variants and `Failbetter Games`. They sort to the top by game count but make poor seeds: an aggregate of 61 unrelated games, or a catalogue so system-specific that little outside it matches. They remain available as *filters*, which is a different job.
+
+---
+
 ## Deployment
 
 Sized for a CPU-only host such as a Hugging Face Space on the free tier (2 vCPU, 16 GB RAM).
 
 ### Precompute the enumerable modes
 
-`userid` and `game_id` queries draw from fixed key sets, so their rankings are computed once offline and served as a lookup — no cross-encoder work at request time:
+`userid`, `game_id`, and `author_id` queries draw from fixed key sets — every user with a profile, every game, every author — so their rankings are computed once offline and served as a lookup, with no cross-encoder work at request time:
 
 ```bash
-uv run scripts/07_precompute.py --mode both --top-n 200
+uv run scripts/07_precompute.py --mode all --top-n 500
 ```
 
 | Artefact | Rows | Keys | Median depth | Size |
 |---|---|---|---|---|
 | `data/precomputed_userid.parquet` | 816,351 | 3,170 | 222 | 14.4 MB |
 | `data/precomputed_gameid.parquet` | 2,269,909 | 10,076 | 198 | 39.2 MB |
+| `data/precomputed_authorid.parquet` | 1,436,646 | 6,291 | 202 | 24.0 MB |
 
 Depth is what makes filtering usable: a `userid` list of 222 survives `year:2020-2026; rating:3.5` with 205 entries left. Two settings produce it, and both were measured free — `min_rerank_score: 0.10` (a relevance floor low enough to leave headroom, high enough that the displayed `Relev.` column never reads `0.0X`) and `prefilter_by_tag`, which keeps only candidates sharing at least one tag with the query. Together they give 1.87x the depth of a 0.30 floor at **identical** Recall/NDCG@10/25 over 300 held-out users.
 
 The tag rule also earns its place on legibility: every stored result shares a visible tag with the query, so a recommendation always has a reason a user can check. Note it matches on `tags_clean`, which folds in `genre` — a UI should show both fields so the matched term is always visible.
 
-Not everything is deep: 3.2% of users and 8.7% of games have fewer than 25 stored results, so a UI should report the true count rather than implying a full page.
+Not everything is deep: 3.2% of users, 8.7% of games, and 9.1% of authors have fewer than 25 stored results, so a UI should report the true count rather than implying a full page.
 
 The pipeline loads these at startup and uses them automatically; if a file is missing, or a key is absent, that query falls back to scoring live. Verified: an uncapped live run reproduces the precomputed ranking exactly, so the cache is a shortcut rather than a second code path.
 
 **Re-run this after retraining the reranker or bi-encoder, or rebuilding the index** — the rankings are tied to the models that produced them.
 
-Full run is ~3.5 hours on Apple M-series GPU (1 h for users, 2.4 h for games). Rows stream to Parquet in batches, so memory stays flat regardless of job size.
+Full run is ~5 hours on Apple M-series GPU (1 h users, 2.4 h games, 1.6 h authors). Rows stream to Parquet in batches and publish by atomic rename, so a reader never sees a half-written file and a failed run cannot destroy the previous artefact. Rows stream to Parquet in batches, so memory stays flat regardless of job size.
 
 ### Resource envelope
 
-**Memory — 1,312 MB** with everything resident: dataframes, FAISS index, both embedding arrays, both models, and both precomputed tables. Comfortable against 16 GB.
+**Memory — ~1,500 MB** with everything resident: dataframes, FAISS index, both embedding arrays, both models, and all three precomputed tables. Comfortable against 16 GB.
+
+The browse cache adds ~85 KB per entry (measured over retained objects, not RSS), so the 2,048-entry cap is ~171 MB. The number worth watching in production is neither of those: PyTorch's allocator grew ~470 MB across 28 scorings in testing and had not clearly plateaued, and it does so whether or not results are cached. A larger cache *reduces* that pressure, since every hit is a scoring that never runs.
 
 **CPU** is the real constraint. The cross-encoder runs at ~135 pairs/s on 2 threads of Apple silicon; a free-tier x86 vCPU is plausibly 1.5–3× slower. That budget is fixed and shared, so concurrent requests divide it — three simultaneous users each wait roughly three times as long. Consider serialising inference (`concurrency_limit=1` in Gradio) so contention becomes a visible queue rather than everyone slowing down at once.
 
-Precomputed modes bypass this entirely; only menu-built `text` queries consume CPU. `rerank_pool_cap` bounds their cost (0 = no cap). Capping to 200 makes queries 2–4× faster and is quality-neutral against held-out positives, but returns only ~37% the same games as the uncapped ranking, so text mode would diverge from the precomputed modes. It ships uncapped for consistency.
+Precomputed modes bypass this entirely; only `browse` queries consume CPU, and those are cached two ways — per session while a user narrows filters, and process-wide across users by (systems, tags). A repeat browse query costs 0.02 s against 4 s cold.
+
+Scoring depends only on the query, never on the filters, so changing a filter re-filters an existing ranking rather than re-scoring it. `rerank_pool_cap` bounds their cost (0 = no cap). Capping to 200 makes queries 2–4× faster and is quality-neutral against held-out positives, but returns only ~37% the same games as the uncapped ranking, so text mode would diverge from the precomputed modes. It ships uncapped for consistency.
 
 ### Building queries from a UI
 

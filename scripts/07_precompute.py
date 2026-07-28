@@ -2,8 +2,9 @@
 """
 Step 7 – Precompute ranked results for the enumerable query modes.
 
-`userid` and `game_id` queries draw from a fixed, known set: every user with a
-profile and every game in the retrieval set. Their rankings only change when the
+`userid`, `game_id`, and `author_id` queries draw from fixed, known sets: every
+user with a profile, every game in the retrieval set, and every author with at
+least two games. Their rankings only change when the
 data or the models change, so they can be computed once offline and served as a
 lookup — which keeps the interactive demo off the CPU entirely for those modes.
 Only menu-built `text` queries then need live cross-encoder work.
@@ -14,12 +15,12 @@ narrow into.
 
 Usage
 -----
-    python scripts/07_precompute.py [--mode userid|game_id|both] [--top-n 500]
+    python scripts/07_precompute.py [--mode userid|game_id|author_id|all] [--top-n 500]
                                     [--limit N] [--out DIR]
 
 Options
 -------
---mode      Which query modes to precompute (default: both)
+--mode      Which query modes to precompute (default: all)
 --top-n     Ranked entries stored per key (default: 500)
 --limit     Only process the first N keys — for smoke tests
 --out       Output directory (default: config paths.data_dir)
@@ -45,13 +46,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from src.utils.env import configure_logging
 configure_logging()
 
-from src.data.preprocessor import parse_profile_text  # noqa: E402
+from src.data.preprocessor import (  # noqa: E402
+    author_game_map, build_author_profiles, parse_profile_text,
+)
 from src.pipeline.retriever import filter_by_tag_overlap  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
 USERID_FILE = "precomputed_userid.parquet"
 GAMEID_FILE = "precomputed_gameid.parquet"
+AUTHORID_FILE = "precomputed_authorid.parquet"
 
 
 def _load_pipeline_module():
@@ -111,6 +115,11 @@ class _ChunkWriter:
 
     def __init__(self, path: Path, key_name: str, chunk_rows: int = 200_000) -> None:
         self.path = path
+        # Write beside the destination and rename on success. Parquet's footer is
+        # only written on close, so a file being streamed to is unreadable —
+        # publishing it only when complete keeps readers from seeing a corrupt
+        # file, and keeps a failed run from destroying the previous artefact.
+        self.temp_path = path.with_suffix(path.suffix + ".partial")
         self.key_name = key_name
         self.chunk_rows = chunk_rows
         self.schema = pa.schema([
@@ -142,7 +151,7 @@ class _ChunkWriter:
         )
         table = pa.Table.from_pandas(frame, schema=self.schema, preserve_index=False)
         if self._writer is None:
-            self._writer = pq.ParquetWriter(self.path, self.schema)
+            self._writer = pq.ParquetWriter(self.temp_path, self.schema)
         self._writer.write_table(table)
         self.total_rows += len(frame)
         self._buffer = []
@@ -151,15 +160,17 @@ class _ChunkWriter:
         self._flush()
         if self._writer is not None:
             self._writer.close()
+            self.temp_path.replace(self.path)   # atomic publish
         size_mb = self.path.stat().st_size / (1024 * 1024) if self.path.exists() else 0.0
         logger.info("Wrote %s — %d rows, %d keys, %.1f MB",
                     self.path.name, self.total_rows, self.total_keys, size_mb)
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Precompute userid / game_id rankings")
+    parser = argparse.ArgumentParser(description="Precompute lookup rankings")
     parser.add_argument("--config", default="config.yaml")
-    parser.add_argument("--mode", default="both", choices=["userid", "game_id", "both"])
+    parser.add_argument("--mode", default="all",
+                        choices=["userid", "game_id", "author_id", "all"])
     parser.add_argument("--top-n", type=int, default=500)
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--out", default=None)
@@ -185,7 +196,7 @@ def main() -> None:
     cfg_r = cfg["retrieval"]
     top_n = args.top_n
 
-    if args.mode in ("userid", "both"):
+    if args.mode in ("userid", "all"):
         users = list(profile_map)
         if args.limit:
             users = users[: args.limit]
@@ -216,7 +227,7 @@ def main() -> None:
                             i, len(users), rate, (len(users) - i) / rate / 60)
         writer.close()
 
-    if args.mode in ("game_id", "both"):
+    if args.mode in ("game_id", "all"):
         games = list(game_query_text_map)
         if args.limit:
             games = games[: args.limit]
@@ -236,6 +247,26 @@ def main() -> None:
                 rate = i / (time.time() - t0)
                 logger.info("  %d/%d games (%.1f/s, ETA %.0f min)",
                             i, len(games), rate, (len(games) - i) / rate / 60)
+        writer.close()
+
+    if args.mode in ("author_id", "all"):
+        profiles = build_author_profiles(game_docs)
+        if args.limit:
+            profiles = profiles.head(args.limit)
+        by_author = author_game_map(game_docs)
+        logger.info("Precomputing %d author_id rankings (top %d each) …", len(profiles), top_n)
+        writer, t0 = _ChunkWriter(out_dir / AUTHORID_FILE, "authorid"), time.time()
+        for i, row in enumerate(profiles.itertuples(index=False), 1):
+            emb = retriever._encode_text(row.profile_text)
+            # Suppress the author's own catalogue, as game_id suppresses its seed.
+            ranked = _rank_one(emb, set(by_author.get(row.authorid, [])), retriever,
+                               reranker, doc_map, cfg_r, bayesian_avg_map,
+                               row.profile_text, top_n, game_info_map)
+            writer.add([(row.authorid, g, s, r, n) for n, (g, s, r) in enumerate(ranked, 1)])
+            if i % 200 == 0:
+                rate = i / (time.time() - t0)
+                logger.info("  %d/%d authors (%.1f/s, ETA %.0f min)",
+                            i, len(profiles), rate, (len(profiles) - i) / rate / 60)
         writer.close()
 
     logger.info("✓ Precompute complete.")

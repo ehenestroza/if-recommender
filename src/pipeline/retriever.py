@@ -103,6 +103,17 @@ class Retriever:
 # Hard filtering
 # ---------------------------------------------------------------------------
 
+def _original_values(info: dict, field: str) -> set:
+    """
+    Lowercased comma-separated values of an original IFDB column.
+
+    Deliberately *not* the `_clean` variant: filters must match what the results
+    table displays, or a filter appears to return games that don't have the thing
+    the user filtered for.
+    """
+    return {v.strip().lower() for v in str(info.get(field, "") or "").split(",") if v.strip()}
+
+
 def apply_hard_filters(
     candidates: List[Tuple[str, float]],
     game_info_map: Dict[str, dict],
@@ -110,6 +121,7 @@ def apply_hard_filters(
     author: Optional[str] = None,
     system: Optional[str] = None,
     tags: Optional[str] = None,
+    genre: Optional[str] = None,
     min_rating: Optional[float] = None,
     min_rating_count: Optional[int] = None,
 ) -> List[Tuple[str, float]]:
@@ -119,15 +131,28 @@ def apply_hard_filters(
     year_range:       "YYYY-YYYY" — game's publication year must fall within the range
     author:           substring match (lowercase) against any individual author name
     system:           substring match (lowercase) against any individual system name
-    tags:             comma-separated; every listed tag must appear in the game's tag set
+    tags:             comma-separated; each must substring-match one of the game's tags
+    genre:            substring match against the game's genre values
     min_rating:       lower bound on the game's raw community average rating;
                       also excludes unrated games, whose average is only the prior
     min_rating_count: lower bound on the number of ratings the game has received
 
-    Author, system, and tag matching runs against the normalised `_clean` values,
-    so a query for "inform" matches a game IFDB lists as "Inform 7 (alternative)".
+    Matching runs against the **original IFDB values**, not the normalised `_clean`
+    ones, so a filter only ever matches something the user can actually see in the
+    results. Two consequences that motivated this:
+
+      * `tags:IFComp 2025` works. Competition tags are stripped from `tags_clean`,
+        so filtering the cleaned values could never match them.
+      * `tags:slice of life` no longer returns games that merely have *genre*
+        "Slice of life" — genre is folded into `tags_clean` but is not shown in
+        the Tags column, which made those matches look like false positives.
+        Use `genre:` to search that field explicitly.
+
+    Substring matching keeps it forgiving: "inform" matches "Inform 7", "horror"
+    matches "cosmic horror".
     """
-    if not any([year_range, author, system, tags, min_rating is not None, min_rating_count is not None]):
+    if not any([year_range, author, system, tags, genre,
+                min_rating is not None, min_rating_count is not None]):
         return candidates
 
     year_lo: Optional[int] = None
@@ -142,6 +167,7 @@ def apply_hard_filters(
 
     author_q = author.strip().lower() if author else None
     system_q = system.strip().lower() if system else None
+    genre_q = genre.strip().lower() if genre else None
     tag_queries: set = (
         {t.strip().lower() for t in tags.split(",") if t.strip()} if tags else set()
     )
@@ -164,15 +190,20 @@ def apply_hard_filters(
                 continue
 
         if author_q:
-            if not any(author_q in a for a in split_clean(info, "author")):
+            if not any(author_q in a for a in _original_values(info, "author")):
                 continue
 
         if system_q:
-            if not any(system_q in s for s in split_clean(info, "system")):
+            if not any(system_q in s for s in _original_values(info, "system")):
+                continue
+
+        if genre_q:
+            if not any(genre_q in g for g in _original_values(info, "genre")):
                 continue
 
         if tag_queries:
-            if not tag_queries.issubset(split_clean(info, "tags")):
+            game_tags = _original_values(info, "tags")
+            if not all(any(q in t for t in game_tags) for q in tag_queries):
                 continue
 
         if min_rating is not None:
