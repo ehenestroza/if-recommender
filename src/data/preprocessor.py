@@ -186,6 +186,46 @@ def parse_profile_text(text: str) -> Tuple[List[str], List[str]]:
     return systems, tags
 
 
+def clean_frequencies(game_docs: pd.DataFrame, column: str) -> Counter:
+    """How many games carry each `_clean` value, for corpus-order display."""
+    counts: Counter = Counter()
+    for value in game_docs[column].fillna(""):
+        counts.update({v.strip() for v in str(value).split(",") if v.strip()})
+    return counts
+
+
+def profile_display(
+    query_text: str,
+    system_freq: Optional[Counter] = None,
+    tag_freq: Optional[Counter] = None,
+) -> str:
+    """
+    Compact rendering of a profile: "twine, ink // mystery, surreal".
+
+    The stored form ("Systems: … Tags: …") is what the encoders were trained on
+    and must not change; this is presentation only. Dropping the labels keeps it
+    lowercase and avoids implying the second list is only tags — genre values are
+    folded into it during preprocessing.
+
+    Pass the frequency maps to order by how common each value is across the
+    corpus, or omit them to keep the stored order. Which is right depends on
+    where the profile came from, because "most frequent" means different things:
+
+      reviewer / author  – stored order is frequency across the games they rated
+                           or wrote, which is the informative one: it says what
+                           this person actually gravitates to.
+      game / vibe        – no such history to count, so corpus order, matching
+                           how the results table orders its own columns.
+    """
+    systems, tags = parse_profile_text(query_text)
+    if system_freq is not None:
+        systems = sorted(systems, key=lambda v: (-system_freq.get(v, 0), v))
+    if tag_freq is not None:
+        tags = sorted(tags, key=lambda v: (-tag_freq.get(v, 0), v))
+    left, right = ", ".join(systems), ", ".join(tags)
+    return f"{left} // {right}" if left and right else (left or right)
+
+
 def profile_vocabulary(
     game_docs: pd.DataFrame, n_systems: int = 12, n_tags: int = 40
 ) -> Tuple[List[str], List[str]]:

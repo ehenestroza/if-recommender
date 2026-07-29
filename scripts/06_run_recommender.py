@@ -2,22 +2,27 @@
 """
 Step 6 – Run the full retrieval + reranking pipeline.
 
-Two modes
----------
-interactive  (default) – enter free-text queries or user IDs at the prompt
-evaluate               – run offline evaluation on the test split
-                         and print Recall@K / NDCG@K / MRR
+The terminal equivalent of app.py, with the same four search modes:
+
+    game      pick a game      → games with a similar feel
+    author    pick an author   → games in their spirit, excluding their own
+    reviewer  pick a reviewer  → what suits their taste, from their history
+    vibe      pick systems/tags → games matching that combination
+
+Every mode picks from a type-ahead list, so nothing here needs an ID pasted out
+of an IFDB URL. Results are then narrowed with the same substring filters the web
+app applies.
+
+Navigation is uniform at every prompt: 'back' (or Ctrl-C) goes up one level,
+'quit' leaves from any depth.
 
 Usage
 -----
-    # Interactive demo
-    python scripts/06_run_pipeline.py
+    # Interactive
+    python scripts/06_run_recommender.py
 
-    # Offline evaluation on test split
-    python scripts/06_run_pipeline.py --mode evaluate
-
-    # Query by user ID
-    python scripts/06_run_pipeline.py --mode interactive --query-type userid
+    # Offline evaluation on the test split
+    python scripts/06_run_recommender.py --mode evaluate
 """
 
 import argparse
@@ -42,8 +47,14 @@ from src.index.faiss_index import GameIndex
 from src.pipeline.retriever import Retriever
 from src.data.preprocessor import (
     SYSTEM_GENRE_SEPARATORS, TAG_SEPARATORS,
-    build_author_profiles, build_display_map, format_display,
-    author_game_map, parse_profile_text,
+    build_author_profiles, build_display_map, clean_frequencies, format_display,
+    format_profile_text, author_game_map, parse_profile_text, profile_display,
+)
+from src.data.pickers import (
+    author_choices, game_choices, reviewer_choices, vocab_choices,
+)
+from src.utils.prompts import (
+    HAS_PROMPT_TOOLKIT, Cancelled, Quit, choose, pick_many, pick_one, read_line,
 )
 from src.pipeline.ranker import Reranker, evaluate_retrieval, select_results
 from src.pipeline.retriever import apply_hard_filters, filter_by_tag_overlap
@@ -95,12 +106,14 @@ def _rating_suffix(row: dict) -> str:
 def _game_row_cells(
     gid: str, score: str, meta: pd.DataFrame, relevance: Optional[dict] = None
 ) -> tuple:
-    """Return display cells for one game row (shared between tables)."""
+    """Return display cells for one game row, in `_add_game_columns` order."""
     # Convert Series → plain dict so subsequent .get() calls return scalars.
     row: dict = meta.loc[gid].to_dict() if gid in meta.index else {}
     rel = relevance.get(gid) if relevance else None
     return (
         score,
+        "–" if rel is None else f"{rel:.2f}",
+        _rating_cell(row),
         str(row.get("title", gid)),
         str(row.get("author", "")),
         str(row.get("year", "")),
@@ -109,44 +122,52 @@ def _game_row_cells(
         # *_display columns are added at load time: deduplicated, canonically cased,
         # ordered by how many games use each tag.
         str(row.get("tags_display", row.get("tags", ""))),
-        "–" if rel is None else f"{rel:.2f}",
-        _rating_cell(row),
     )
 
 
 def _add_game_columns(table) -> None:
-    """Add standard game columns to a Rich table."""
-    table.add_column("Score",  style="cyan",       width=8)
-    table.add_column("Title",  style="bold white",  min_width=24)
-    table.add_column("Author", style="yellow")
-    table.add_column("Year",   style="dim",         width=6)
-    table.add_column("System", style="blue")
-    table.add_column("Genre",  style="cyan")
-    table.add_column("Tags",   style="violet")
-    # The two components of Score, shown so their trade-off is visible.
-    table.add_column("Relev.", style="green",      width=6)
-    table.add_column("Rating", style="magenta",    width=10)
+    """
+    Add the game columns, in the web app's order.
+
+    Score first, then the two numbers it is made of, then the game itself — so
+    the trade-off between relevance and rating sits next to the score it explains
+    rather than at the far end of a wide table.
+    """
+    table.add_column("score",     style="cyan",       width=6)
+    table.add_column("relevance", style="green",      width=9)
+    table.add_column("rating",    style="magenta",    width=10)
+    table.add_column("title",     style="bold white", min_width=24)
+    table.add_column("author",    style="yellow")
+    table.add_column("year",      style="dim",        width=6)
+    table.add_column("system",    style="blue")
+    table.add_column("genre",     style="cyan")
+    table.add_column("tags",      style="violet")
 
 
 def print_results(
     results: List[tuple],
     game_meta: pd.DataFrame,
-    query: str,
     relevance: Optional[dict] = None,
 ) -> None:
-    """Display top-K results in a readable table."""
+    """
+    Display top-K results in a readable table.
+
+    Untitled: the Query panel printed just above already names what was searched
+    from, and repeating it here read as noise — worst in vibe mode, where the
+    only available label was the raw profile text.
+    """
     meta = game_meta.set_index("gameid")
 
     if HAS_RICH:
         from rich.table import Table
-        table = Table(title=f"Results for: [bold]{query}[/bold]", show_lines=True)
+        table = Table(show_lines=True)
         table.add_column("#", style="dim", width=4)
         _add_game_columns(table)
         for rank, (gid, score) in enumerate(results, start=1):
-            table.add_row(str(rank), *_game_row_cells(gid, f"{score:.4f}", meta, relevance))
+            table.add_row(str(rank), *_game_row_cells(gid, f"{score:.2f}", meta, relevance))
         console.print(table)
     else:
-        print(f"\nResults for: {query}")
+        print()
         print("-" * 80)
         for rank, (gid, score) in enumerate(results, start=1):
             row: dict = meta.loc[gid].to_dict() if gid in meta.index else {}
@@ -155,90 +176,40 @@ def print_results(
             year_str = f" {year}" if year else ""
             rel = relevance.get(gid) if relevance else None
             rel_str = f" rel {rel:.2f}" if rel is not None else ""
-            print(f"  {rank:2d}. [{score:.4f}]{rel_str} {row.get('title', gid)} "
+            print(f"  {rank:2d}. [{score:.2f}]{rel_str} {row.get('title', gid)} "
                   f"({row.get('author','')}){year_str} — {row.get('system','')}{rating_str}")
         print()
 
 
-def print_game_summary(gid: str, game_meta: pd.DataFrame, label: str = "Game") -> None:
-    """Print a single game's metadata in the standard table format."""
-    meta = game_meta.set_index("gameid")
-    if HAS_RICH:
-        from rich.table import Table
-        table = Table(title=f"[bold]{label}[/bold]", show_lines=True)
-        _add_game_columns(table)
-        table.add_row(*_game_row_cells(gid, "–", meta))
-        console.print(table)
-    else:
-        row: dict = meta.loc[gid].to_dict() if gid in meta.index else {}
-        rating_str = _rating_suffix(row)
-        year = row.get("year", "")
-        year_str = f" {year}" if year else ""
-        print(f"\n{label}: {row.get('title', gid)} "
-              f"({row.get('author','')}){year_str} — {row.get('system','')}{rating_str}")
-        print()
+def print_query_panel(kind: str, subject: str, profile: str) -> None:
+    """
+    Print what is being searched from, in one shape for all four modes.
 
-
-def print_user_profile(userid: str, profile_text: str, user_name: str = "") -> None:
-    """Print a user's taste profile in a readable format."""
-    display_id = f"{user_name} ({userid})" if user_name else userid
+    A line naming the pick, then the profile it resolved to, rendered the app's
+    way — "inform // parser, puzzles", no field labels. Game mode used to print
+    the seed game's full metadata row instead, which put the query in a different
+    place and format depending on how you got there, and showed columns (genre,
+    rating) that say nothing about what the search will actually match on.
+    """
+    heading = f"{kind}: {subject}" if subject else kind
     if HAS_RICH:
+        from rich.console import Group
         from rich.panel import Panel
-        from rich.text import Text
-        lines = Text()
-        lines.append(f"User: {display_id}\n", style="bold cyan")
-        for part in profile_text.split(". "):
-            if ": " in part:
-                key, val = part.split(": ", 1)
-                lines.append(f"  {key}: ", style="bold yellow")
-                lines.append(f"{val}\n")
-            else:
-                lines.append(f"  {part}\n")
-        console.print(Panel(lines, title="User Profile", border_style="cyan"))
-    else:
-        print(f"\nUser profile — {display_id}")
-        print("-" * 60)
-        for part in profile_text.split(". "):
-            print(f"  {part}")
-        print()
-
-
-def print_rated_games(
-    rated: List[tuple],
-    game_docs: "pd.DataFrame",
-) -> None:
-    """Print a table of games the user has rated highly (rating, title, author, …)."""
-    if not rated:
-        return
-    meta = game_docs.set_index("gameid")
-    if HAS_RICH:
         from rich.table import Table
-        table = Table(title="Games you've rated highly", show_lines=True)
-        table.add_column("Your ★", style="magenta", width=7)
-        table.add_column("Title",  style="bold white", min_width=30)
-        table.add_column("Author", style="yellow")
-        table.add_column("Year",   style="dim",        width=6)
-        table.add_column("System", style="blue")
-        table.add_column("Genre",  style="cyan")
-        table.add_column("Tags",   style="violet")
-        for gid, rating in rated:
-            row: dict = meta.loc[gid].to_dict() if gid in meta.index else {}
-            table.add_row(
-                f"★{rating}/5",
-                str(row.get("title", gid)),
-                str(row.get("author", "")),
-                str(row.get("year", "")),
-                str(row.get("system_display", row.get("system", ""))),
-                str(row.get("genre_display", row.get("genre", ""))),
-                str(row.get("tags_display", row.get("tags", ""))),
-            )
-        console.print(table)
+        from rich.text import Text
+        # A grid rather than one wrapped Text: profiles are long enough to wrap,
+        # and in a plain Text the continuation returns to column zero, level with
+        # the heading, which reads as a second field rather than more of the same.
+        grid = Table.grid(padding=(0, 1))
+        grid.add_column(width=1)
+        grid.add_column(style="yellow", overflow="fold")
+        grid.add_row("", profile)
+        console.print(Panel(Group(Text(heading, style="bold cyan"), grid),
+                            title="query", border_style="cyan"))
     else:
-        print("\nGames rated highly:")
+        print(f"\n{heading}")
         print("-" * 60)
-        for gid, rating in rated:
-            row = meta.loc[gid].to_dict() if gid in meta.index else {}
-            print(f"  ★{rating}/5 — {row.get('title', gid)} ({row.get('author', '')})")
+        print(f"  {profile}")
         print()
 
 
@@ -329,10 +300,10 @@ def load_precomputed(path: Path, key_col: str) -> dict:
     return table
 
 
-FILTER_HELP = """  Refine these results with filters, e.g.  year:2020-2026; rating:3.5; count:2
-  Keys: year, author, system, tags, genre, rating, count   (each entry replaces the last)
-  Values match what the results show, e.g.  tags:IFComp 2025  ·  system:Inform 7
-  'clear' show all again  ·  'back' new query  ·  'quit' exit"""
+FILTER_HELP = """  refine these results with filters, e.g.  year:2020-2026; rating:3.5; count:2
+  keys: year, author, system, tags, genre, rating, count   (each entry replaces the last)
+  values match what the results show, e.g.  tags:IFComp 2025  ·  system:Inform 7
+  'clear' show all again  ·  'back' pick again  ·  'mode' change mode  ·  'quit' exit"""
 
 
 def show_results(
@@ -345,7 +316,6 @@ def show_results(
     use_diversity: bool,
     target_genres: set,
     target_systems: set,
-    label: str,
     relevance: Optional[dict] = None,
 ) -> None:
     """
@@ -364,9 +334,9 @@ def show_results(
         logger.info("Filters kept %d of %d scored candidates", len(results), len(scored))
 
     if not results:
-        print("  Nothing matches those filters. Try relaxing them, or 'clear'.\n")
+        print("  nothing matches those filters. try relaxing them, or 'clear'.\n")
         return
-    print_results(results, game_docs, label, relevance=relevance)
+    print_results(results, game_docs, relevance=relevance)
 
 
 # ---------------------------------------------------------------------------
@@ -514,10 +484,122 @@ def load_artefacts(cfg: dict):
 # Interactive mode
 # ---------------------------------------------------------------------------
 
+SEARCH_MODES = [
+    ("game      ·  games with a similar feel", "game"),
+    ("author    ·  games in an author's spirit, excluding their own", "author"),
+    ("reviewer  ·  what suits a reviewer's taste, from their history", "reviewer"),
+    ("vibe      ·  games matching the systems and tags you pick", "vibe"),
+]
+
+# Offered as completions on the filter line, so the syntax is discoverable
+# without reading the help text.
+FILTER_WORDS = ["year:", "author:", "system:", "tags:", "genre:", "rating:", "count:",
+                "clear", "back", "mode", "quit", "help"]
+
+
+def _picker(cache: dict, name: str, build):
+    """Build a choice list on first use.
+
+    Each list costs a pass over 10k games, and a session only ever touches the
+    one or two its mode needs.
+    """
+    if name not in cache:
+        cache[name] = build()
+    return cache[name]
+
+
+def _profile_for(picks: dict, game_docs, query_text: str, corpus_order: bool) -> str:
+    """Render a profile the app's way; corpus order for game/vibe (see profile_display)."""
+    if not corpus_order:
+        return profile_display(query_text)
+    freq = _picker(picks, "freq", lambda: (
+        clean_frequencies(game_docs, "system_clean"),
+        clean_frequencies(game_docs, "tags_clean"),
+    ))
+    return profile_display(query_text, *freq)
+
+
+def _prompt_query(
+    search: str, picks: dict, *,
+    retriever, query_encoder, game_docs, doc_map, profile_map, name_map,
+    game_query_text_map, reviews_df, playedgames_df,
+    author_profile_map, author_name_map, author_games,
+):
+    """
+    Ask this mode for its input and return everything the scoring path needs.
+
+    Returns (key, query_text, emb, seen_games) or None if the mode could
+    not build a query. Raises Cancelled when the user backs out.
+    """
+    if search == "game":
+        choices = _picker(picks, "game", lambda: game_choices(game_docs))
+        gid = pick_one("game", choices)
+        label = next(lbl for lbl, v in choices if v == gid)
+        query_text = game_query_text_map.get(gid, doc_map.get(gid, gid))
+        print_query_panel("game", label, _profile_for(picks, game_docs, query_text, True))
+        emb = retriever._encode_game_ids([gid])
+        if emb is None:
+            print(f"  could not encode game '{gid}'")
+            return None
+        # Its own entry would otherwise top the ranking.
+        return gid, query_text, emb, {gid}
+
+    if search == "author":
+        choices = _picker(picks, "author", lambda: author_choices(pd.DataFrame({
+            "authorid": list(author_profile_map),
+            "name": [author_name_map.get(a, a) for a in author_profile_map],
+            "game_count": [len(author_games.get(a, [])) for a in author_profile_map],
+        })))
+        key = pick_one("author", choices)
+        query_text = author_profile_map[key]
+        name = author_name_map.get(key, key)
+        n_games = len(author_games.get(key, []))
+        print_query_panel("author", f"{name} — {n_games} game{'s' if n_games != 1 else ''}",
+                          _profile_for(picks, game_docs, query_text, False))
+        emb = query_encoder.encode([query_text], normalize_embeddings=True)[0]
+        # Suppress the author's own catalogue, as game mode suppresses its seed.
+        return key, query_text, emb, set(author_games.get(key, []))
+
+    if search == "reviewer":
+        choices = _picker(picks, "reviewer",
+                          lambda: reviewer_choices(profile_map, name_map, reviews_df))
+        uid = pick_one("reviewer", choices)
+        emb = retriever._encode_userid(uid)
+        if emb is None:
+            print(f"  no profile found for reviewer '{uid}'")
+            return None
+        query_text = profile_map.get(uid, "")
+        name = name_map.get(uid, "") if name_map else ""
+        print_query_panel("reviewer", name or uid, _profile_for(picks, game_docs, query_text, False))
+
+        # Everything they have already reviewed or played, so recommendations are
+        # things they have not seen.
+        seen: set = set()
+        if reviews_df is not None and "userid" in reviews_df.columns:
+            seen = set(reviews_df[reviews_df["userid"] == uid]["gameid"])
+        if playedgames_df is not None and "userid" in playedgames_df.columns:
+            seen |= set(playedgames_df[playedgames_df["userid"] == uid]["gameid"])
+        return uid, query_text, emb, seen
+
+    # vibe — built from the trained vocabulary, so every pick is a token the
+    # encoders actually saw.
+    systems_c, tags_c = _picker(picks, "vocab", lambda: vocab_choices(game_docs))
+    print("  pick systems, then tags. blank line moves on.")
+    systems = pick_many("system", systems_c)
+    tags = pick_many("tag", tags_c)
+    if not systems and not tags:
+        print("  nothing picked.")
+        return None
+    query_text = format_profile_text(systems, tags)
+    print_query_panel("vibe", "", _profile_for(picks, game_docs, query_text, True))
+    emb = query_encoder.encode([query_text], normalize_embeddings=True)[0]
+    return None, query_text, emb, set()
+
+
 def run_interactive(
     retriever, reranker, query_encoder,
     game_docs, doc_map, profile_map, name_map,
-    cfg, query_type: str = "text",
+    cfg,
     bayesian_avg_map=None,
     reviews_df=None,
     playedgames_df=None,
@@ -549,104 +631,62 @@ def run_interactive(
         game_query_text_map = doc_map
 
     print("\n" + "=" * 60)
-    print("  IFDB Retrieval Demo")
+    print("  IFDB recs")
     print("=" * 60)
-    print(f"  Query type       : {query_type}")
-    print(f"  Score threshold  : {min_score}   Output: {top_k_rank}")
-    print("  Enter a query to see results, then refine them with filters.")
-    print("  Type 'quit' to exit.\n")
+    print(f"  score threshold  : {min_score}   output: {top_k_rank}")
+    print("  pick something to search from, then refine the results with filters.")
+    print("  'back' goes up a level anywhere  ·  'quit' exits.")
+    if not HAS_PROMPT_TOOLKIT:
+        print("  (install prompt_toolkit for type-ahead pickers)")
+    print()
 
-    game_meta = game_docs.set_index("gameid")
+    picks: dict = {}
+    mode = None
 
     while True:
+        if mode is None:
+            print("  search by:")
+            try:
+                mode = choose("mode", SEARCH_MODES)
+            except (Cancelled, Quit):
+                return   # nothing sits above the menu, so backing out of it exits
+            print()
+
         try:
-            query = input("Query > ").strip()
-        except (EOFError, KeyboardInterrupt):
-            break
-        if query.lower() in ("quit", "exit", "q"):
-            break
-        if not query:
+            built = _prompt_query(
+                mode, picks,
+                retriever=retriever, query_encoder=query_encoder,
+                game_docs=game_docs, doc_map=doc_map,
+                profile_map=profile_map, name_map=name_map,
+                game_query_text_map=game_query_text_map,
+                reviews_df=reviews_df, playedgames_df=playedgames_df,
+                author_profile_map=author_profile_map,
+                author_name_map=author_name_map, author_games=author_games,
+            )
+        except Cancelled:
+            mode = None      # out of the picker, back to the mode menu
             continue
+        except Quit:
+            return
 
-        seen_games: set = set()
-        target_genres: set = set()
-        target_systems: set = set()
+        if built is None:
+            continue
+        key, query_text, emb, seen_games = built
 
-        if query_type == "userid":
-            emb = retriever._encode_userid(query)
-            if emb is None:
-                print(f"  No profile found for user '{query}'")
-                continue
-            profile_text = profile_map.get(query, "")
-            user_name = name_map.get(query, "") if name_map else ""
-            print_user_profile(query, profile_text, user_name=user_name)
-
-            # Build seen-games set: all reviewed + all played games for this user
-            if reviews_df is not None and "userid" in reviews_df.columns:
-                user_revs = reviews_df[reviews_df["userid"] == query]
-                seen_games = set(user_revs["gameid"])
-
-                # Show up to 10 games rated >= 4 (actual rating, not Bayesian avg)
-                high_rated = (
-                    user_revs[user_revs["rating"] >= 4]
-                    .sort_values("rating", ascending=False)
-                    .head(10)
-                )
-                if len(high_rated) > 0:
-                    rated_pairs = list(zip(
-                        high_rated["gameid"],
-                        high_rated["rating"].astype(int),
-                    ))
-                    print_rated_games(rated_pairs, game_docs)
-
-            if playedgames_df is not None and "userid" in playedgames_df.columns:
-                seen_games |= set(playedgames_df[playedgames_df["userid"] == query]["gameid"])
-
-            query_text = profile_text
-            target_genres, target_systems = _parse_profile_targets(profile_text)
-
-        elif query_type == "game_id":
-            if query not in game_meta.index:
-                print(f"  Game ID '{query}' not found in index")
-                continue
-            print_game_summary(query, game_docs, label="Input game")
-            emb = retriever._encode_game_ids([query])
-            if emb is None:
-                print(f"  Could not encode game '{query}'")
-                continue
-            query_text = game_query_text_map.get(query, doc_map.get(query, query))
-            target_genres, target_systems = _parse_profile_targets(query_text)
+        # Diversity targets come from the query itself, so results spread across
+        # the systems the query is actually made of.
+        target_genres, target_systems = _parse_profile_targets(query_text)
+        if mode == "game":
             target_systems = set(list(target_systems)[:1])
 
-        elif query_type == "author_id":
-            # Author names are the key; match case-insensitively so the user can
-            # type them as they appear in the results table.
-            key = query.strip().lower()
-            if key not in author_profile_map:
-                print(f"  No profile for author '{query}' — "
-                      f"{len(author_profile_map)} authors available")
-                continue
-            query_text = author_profile_map[key]
-            print_user_profile(author_name_map.get(key, query), query_text,
-                               user_name=f"{len(author_games.get(key, []))} games")
-            emb = query_encoder.encode([query_text], normalize_embeddings=True)[0]
-            # Suppress the author's own catalogue, as game_id suppresses its seed.
-            seen_games = set(author_games.get(key, []))
-            target_genres, target_systems = _parse_profile_targets(query_text)
-
-        else:  # text — no structured targets, diversity is a no-op
-            emb = query_encoder.encode([query], normalize_embeddings=True)[0]
-            query_text = query
-
-        # userid and game_id draw from a fixed key set, so their rankings are
-        # precomputed offline (scripts/07_precompute.py) and served as a lookup.
+        # game, author and reviewer draw from fixed key sets, so their rankings
+        # are precomputed offline (scripts/07_precompute.py) and served as a
+        # lookup. Only vibe is scored live.
         cached = None
-        if query_type == "userid":
-            cached = precomputed_user.get(query)
-        elif query_type == "game_id":
-            cached = precomputed_game.get(query)
-        elif query_type == "author_id":
-            cached = precomputed_author.get(query.strip().lower())
+        if key is not None:
+            cached = {"reviewer": precomputed_user,
+                      "game": precomputed_game,
+                      "author": precomputed_author}[mode].get(key)
 
         if cached is not None:
             gids, scores, rels = cached
@@ -660,15 +700,11 @@ def run_interactive(
             # reranking would hide most of what the reranker would have chosen —
             # and would make a filter change which candidates get scored at all.
             candidates = retriever.index.search(emb, min_score=min_score)
-
-            # Remove seen/query games
-            if query_type in ("userid", "author_id") and seen_games:
+            if seen_games:
                 candidates = [(gid, s) for gid, s in candidates if gid not in seen_games]
-            elif query_type == "game_id":
-                candidates = [(gid, s) for gid, s in candidates if gid != query]
 
             if not candidates:
-                print("  No candidates above the retrieval threshold.\n")
+                print("  no candidates above the retrieval threshold.\n")
                 continue
 
             # Drop candidates sharing no tag with the query. Measured free, and
@@ -704,20 +740,24 @@ def run_interactive(
             scored, flt,
             game_docs=game_docs, game_info_map=game_info_map, top_k=top_k_rank,
             use_diversity=use_diversity, target_genres=target_genres,
-            target_systems=target_systems, label=query, relevance=relevance,
+            target_systems=target_systems, relevance=relevance,
         )
         render({})
 
         # Refine loop: filters are applied to the cached ranking above, so
         # they narrow these results instead of triggering a fresh search.
         print(FILTER_HELP)
+        to_menu = False
         while True:
             try:
-                raw = input("Filter > ").strip()
-            except (EOFError, KeyboardInterrupt):
-                return
-            command = raw.lower()
+                raw = read_line("filter", FILTER_WORDS)
+            except Cancelled:
+                break    # same as 'back': up one level, to the picker
+            command = raw.strip().lower()
             if command in ("back", "b"):
+                break
+            if command in ("mode", "m"):
+                to_menu = True       # shortcut past the picker
                 break
             if command in ("quit", "exit", "q"):
                 return
@@ -729,9 +769,12 @@ def run_interactive(
                 continue
             hard_filters = _parse_filters(raw)
             if not hard_filters:
-                print("  Could not read that. Filters look like 'rating:3.5; year:2020-2026'.")
+                print("  could not read that. filters look like 'rating:3.5; year:2020-2026'.")
                 continue
             render(hard_filters)
+
+        if to_menu:
+            mode = None
 
 
 # ---------------------------------------------------------------------------
@@ -818,8 +861,6 @@ def main() -> None:
     parser.add_argument("--config",     default="config.yaml")
     parser.add_argument("--mode",       default="interactive",
                         choices=["interactive", "evaluate"])
-    parser.add_argument("--query-type", default="text",
-                        choices=["text", "userid", "game_id", "author_id"])
     parser.add_argument("--rerank", action="store_true",
                         help="Evaluate mode: score candidates with the reranker, "
                              "as the interactive pipeline does (slower)")
@@ -843,7 +884,7 @@ def main() -> None:
         run_interactive(
             retriever, reranker, query_encoder,
             game_docs, doc_map, profile_map, name_map,
-            cfg, query_type=args.query_type,
+            cfg,
             bayesian_avg_map=bayesian_avg_map,
             reviews_df=reviews_df,
             playedgames_df=playedgames_df,

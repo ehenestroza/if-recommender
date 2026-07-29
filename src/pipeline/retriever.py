@@ -103,6 +103,20 @@ class Retriever:
 # Hard filtering
 # ---------------------------------------------------------------------------
 
+def _query_terms(value) -> List[str]:
+    """
+    Normalise a filter argument to lowercased terms.
+
+    Accepts a single string or a list, because the UI supplies multiple values
+    for author, system and genre — a game has one system, so picking two means
+    "either", not "both".
+    """
+    if value is None:
+        return []
+    values = [value] if isinstance(value, str) else list(value)
+    return [str(v).strip().lower() for v in values if str(v).strip()]
+
+
 def _original_values(info: dict, field: str) -> set:
     """
     Lowercased comma-separated values of an original IFDB column.
@@ -129,10 +143,14 @@ def apply_hard_filters(
     Filter a candidate list by optional hard constraints (all are AND-ed together).
 
     year_range:       "YYYY-YYYY" — game's publication year must fall within the range
-    author:           substring match (lowercase) against any individual author name
-    system:           substring match (lowercase) against any individual system name
-    tags:             comma-separated; each must substring-match one of the game's tags
-    genre:            substring match against the game's genre values
+    author:           term(s) substring-matched against any individual author name
+    system:           term(s) substring-matched against any individual system name
+    genre:            term(s) substring-matched against the game's genre values
+    tags:             every listed tag must substring-match one of the game's tags
+
+    author, system and genre accept a list and match if ANY term hits; tags
+    require ALL. A game has one system, so listing two means "either", whereas
+    listing two tags means "both".
     min_rating:       lower bound on the game's raw community average rating;
                       also excludes unrated games, whose average is only the prior
     min_rating_count: lower bound on the number of ratings the game has received
@@ -165,9 +183,9 @@ def apply_hard_filters(
             except ValueError:
                 logger.warning("Invalid year_range %r — ignoring", year_range)
 
-    author_q = author.strip().lower() if author else None
-    system_q = system.strip().lower() if system else None
-    genre_q = genre.strip().lower() if genre else None
+    author_q = _query_terms(author)
+    system_q = _query_terms(system)
+    genre_q = _query_terms(genre)
     tag_queries: set = (
         {t.strip().lower() for t in tags.split(",") if t.strip()} if tags else set()
     )
@@ -189,16 +207,17 @@ def apply_hard_filters(
             if year_hi is not None and year > year_hi:
                 continue
 
+        # Any of the listed terms may match (OR); tags below require all (AND).
         if author_q:
-            if not any(author_q in a for a in _original_values(info, "author")):
+            if not any(q in a for q in author_q for a in _original_values(info, "author")):
                 continue
 
         if system_q:
-            if not any(system_q in s for s in _original_values(info, "system")):
+            if not any(q in s for q in system_q for s in _original_values(info, "system")):
                 continue
 
         if genre_q:
-            if not any(genre_q in g for g in _original_values(info, "genre")):
+            if not any(q in g for q in genre_q for g in _original_values(info, "genre")):
                 continue
 
         if tag_queries:

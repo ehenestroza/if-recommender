@@ -59,10 +59,10 @@ AUTHORID_FILE = "precomputed_authorid.parquet"
 
 
 def _load_pipeline_module():
-    """Import 06_run_pipeline.py by path (its name is not a valid identifier)."""
+    """Import 06_run_recommender.py by path (its name is not a valid identifier)."""
     import importlib.util
 
-    path = Path(__file__).resolve().parent / "06_run_pipeline.py"
+    path = Path(__file__).resolve().parent / "06_run_recommender.py"
     spec = importlib.util.spec_from_file_location("pipeline_mod", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -179,7 +179,7 @@ def main() -> None:
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
 
-    # 06_run_pipeline.py starts with a digit, so it cannot be imported by name.
+    # 06_run_recommender.py starts with a digit, so it cannot be imported by name.
     # Load it by path to reuse load_artefacts() rather than duplicating it —
     # the precompute must load exactly what the live path loads.
     mod = _load_pipeline_module()
