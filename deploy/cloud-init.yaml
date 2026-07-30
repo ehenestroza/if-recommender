@@ -1,0 +1,164 @@
+#cloud-config
+#
+# OCI cloud-init for the IFDB recs web app.
+#
+# Paste into "Show advanced options → Management → Cloud-init script" when
+# creating the instance, or pass with:
+#     oci compute instance launch --user-data-file deploy/cloud-init.yaml ...
+#
+# Works on Ubuntu 24.04, x86_64 or Ampere A1 (aarch64). Nothing here depends on
+# the distro's Python: uv downloads its own CPython 3.14, so 24.04 shipping 3.12
+# is irrelevant and the system interpreter is left alone for system tools.
+#
+# EDIT THE TWO VALUES UNDER `write_files: /etc/if-recommender.env` BELOW.
+#
+# See deploy/README.md for the two steps this cannot do for you (opening the
+# port in the OCI security list, and TLS).
+
+package_update: true
+packages:
+  - git
+  - nginx
+  - iptables-persistent
+
+write_files:
+  # ---------------------------------------------------------------------------
+  # Deployment settings. REPO is the only value you must set.
+  # ---------------------------------------------------------------------------
+  - path: /etc/if-recommender.env
+    permissions: "0644"
+    content: |
+      # Public HTTPS URL, or git@github.com:owner/repo.git with a deploy key.
+      REPO=https://github.com/ehenestroza/if-recommender.git
+      BRANCH=main
+
+  # ---------------------------------------------------------------------------
+  # Runtime environment for the service.
+  # ---------------------------------------------------------------------------
+  - path: /etc/if-recommender-runtime.env
+    permissions: "0644"
+    content: |
+      # Bound to localhost: nginx is the only thing that talks to it, so the app
+      # is never on the public interface.
+      GRADIO_SERVER_NAME=127.0.0.1
+      GRADIO_SERVER_PORT=7860
+      # glibc allocates a heap arena per thread and rarely returns memory. The
+      # app's growth under load is arena, not live objects, so capping arenas
+      # bounds it. macOS has no equivalent, which is why laptop measurements of
+      # this app's memory do not transfer.
+      MALLOC_ARENA_MAX=2
+      # Torch otherwise starts one thread per core and oversubscribes a 2-OCPU
+      # shape, where inference is already serialised behind Gradio's queue.
+      OMP_NUM_THREADS=2
+      MKL_NUM_THREADS=2
+
+  # ---------------------------------------------------------------------------
+  # systemd service — restarts on failure and comes back after reboot.
+  # ---------------------------------------------------------------------------
+  - path: /etc/systemd/system/if-recommender.service
+    permissions: "0644"
+    content: |
+      [Unit]
+      Description=IFDB recs web app
+      After=network-online.target
+      Wants=network-online.target
+
+      [Service]
+      Type=simple
+      User=ubuntu
+      WorkingDirectory=/opt/if-recommender
+      Environment=HOME=/home/ubuntu
+      EnvironmentFile=/etc/if-recommender-runtime.env
+      ExecStart=/usr/local/bin/uv run --frozen python app.py
+      Restart=always
+      RestartSec=10
+      # Loading the models, FAISS index and ranking tables takes a while on two
+      # cores; systemd must not call that a failed start.
+      TimeoutStartSec=600
+      StandardOutput=journal
+      StandardError=journal
+
+      [Install]
+      WantedBy=multi-user.target
+
+  # ---------------------------------------------------------------------------
+  # nginx reverse proxy.
+  # ---------------------------------------------------------------------------
+  - path: /etc/nginx/sites-available/if-recommender
+    permissions: "0644"
+    content: |
+      server {
+          listen 80 default_server;
+          listen [::]:80 default_server;
+          server_name _;
+
+          # Model weights and the ranking tables make responses large; results
+          # pages are HTML tables of up to 50 rows.
+          client_max_body_size 16m;
+
+          location / {
+              proxy_pass http://127.0.0.1:7860;
+              proxy_http_version 1.1;
+
+              # Gradio's queue runs over websockets and server-sent events. Both
+              # need the upgrade headers, and SSE needs buffering off or the
+              # progress updates arrive all at once when the response completes.
+              proxy_set_header Upgrade $http_upgrade;
+              proxy_set_header Connection "upgrade";
+              proxy_buffering off;
+              proxy_cache off;
+
+              proxy_set_header Host $host;
+              proxy_set_header X-Real-IP $remote_addr;
+              proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+              proxy_set_header X-Forwarded-Proto $scheme;
+
+              # A cold vibe query scores the whole candidate pool with the
+              # cross-encoder on two cores. The default 60s can cut that off.
+              proxy_read_timeout 300s;
+              proxy_send_timeout 300s;
+          }
+      }
+
+runcmd:
+  - set -eux
+
+  # OCI's Ubuntu images ship an iptables policy that accepts established traffic
+  # and port 22, then rejects the rest — so port 80 is blocked in the OS even
+  # once the security list allows it. Insert ahead of that reject and persist.
+  - iptables -I INPUT 1 -p tcp --dport 80 -m conntrack --ctstate NEW -j ACCEPT
+  - netfilter-persistent save
+
+  # uv, installed system-wide rather than under ~ubuntu: the installer's default
+  # is $XDG_BIN_HOME then $HOME/.local/bin, so a hardcoded per-user ExecStart path
+  # would break silently if either changed. UV_INSTALL_DIR pins it.
+  - curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin INSTALLER_NO_MODIFY_PATH=1 sh
+  - /usr/local/bin/uv --version
+
+  # Shallow clone: full history carries every superseded copy of the models and
+  # ranking tables, which is several times the size of the checkout itself.
+  - . /etc/if-recommender.env
+  - install -d -o ubuntu -g ubuntu /opt/if-recommender
+  - su - ubuntu -c "git clone --depth 1 --branch $BRANCH $REPO /opt/if-recommender"
+
+  # Downloads CPython 3.14 and the exact locked dependency versions. --frozen
+  # refuses to re-resolve, so the VM gets what was tested rather than whatever
+  # is newest today.
+  - su - ubuntu -c 'cd /opt/if-recommender && /usr/local/bin/uv sync --frozen'
+
+  - ln -sf /etc/nginx/sites-available/if-recommender /etc/nginx/sites-enabled/if-recommender
+  - rm -f /etc/nginx/sites-enabled/default
+  - nginx -t
+  - systemctl restart nginx
+  - systemctl daemon-reload
+  - systemctl enable --now if-recommender
+
+final_message: |
+  IFDB recs deployed after $UPTIME seconds.
+
+  Reachable on http://<public-ip>/ once the OCI security list allows port 80
+  (see deploy/README.md — cloud-init cannot open that for you).
+
+    systemctl status if-recommender
+    journalctl -u if-recommender -f
+    cd /opt/if-recommender && sudo -u ubuntu /usr/local/bin/uv run scripts/measure_memory.py
