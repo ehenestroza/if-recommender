@@ -10,10 +10,10 @@
 # the distro's Python: uv downloads its own CPython 3.14, so 24.04 shipping 3.12
 # is irrelevant and the system interpreter is left alone for system tools.
 #
-# EDIT THE TWO VALUES UNDER `write_files: /etc/if-recommender.env` BELOW.
+# EDIT THE VALUES UNDER `write_files: /etc/if-recommender.env` BELOW.
 #
-# See deploy/README.md for the two steps this cannot do for you (opening the
-# port in the OCI security list, and TLS).
+# See deploy/README.md for the two steps this cannot do for you: opening ports
+# 80 and 443 in the OCI security list, and issuing the TLS certificate.
 
 package_update: true
 packages:
@@ -23,7 +23,7 @@ packages:
 
 write_files:
   # ---------------------------------------------------------------------------
-  # Deployment settings. REPO is the only value you must set.
+  # Deployment settings. REPO and DOMAIN are the values you must set.
   # ---------------------------------------------------------------------------
   - path: /etc/if-recommender.env
     permissions: "0644"
@@ -32,8 +32,16 @@ write_files:
       REPO=https://github.com/ehenestroza/if-recommender.git
       BRANCH=main
 
+      # Public hostname. Drives nginx's server_name and is the -d argument to
+      # certbot. Leave empty to serve on the bare IP as a catch-all, which is
+      # what you want before DNS exists — certbot cannot issue for an IP.
+      DOMAIN=ifdb-recs.datalexic.com
+
   # ---------------------------------------------------------------------------
-  # Runtime environment for the service.
+  # Runtime environment for the service. The thread caps are appended by runcmd
+  # from nproc rather than written here: this file is shape-independent, and a
+  # hardcoded 2 silently wastes half of a 4-vCPU E5 the way a hardcoded 4
+  # oversubscribes a 2-OCPU A1.
   # ---------------------------------------------------------------------------
   - path: /etc/if-recommender-runtime.env
     permissions: "0644"
@@ -47,10 +55,6 @@ write_files:
       # bounds it. macOS has no equivalent, which is why laptop measurements of
       # this app's memory do not transfer.
       MALLOC_ARENA_MAX=2
-      # Torch otherwise starts one thread per core and oversubscribes a 2-OCPU
-      # shape, where inference is already serialised behind Gradio's queue.
-      OMP_NUM_THREADS=2
-      MKL_NUM_THREADS=2
 
   # ---------------------------------------------------------------------------
   # systemd service — restarts on failure and comes back after reboot.
@@ -82,7 +86,12 @@ write_files:
       WantedBy=multi-user.target
 
   # ---------------------------------------------------------------------------
-  # nginx reverse proxy.
+  # nginx reverse proxy. __SERVER_NAME__ is substituted from DOMAIN by runcmd.
+  #
+  # Only the plain-HTTP vhost is defined here. certbot --nginx rewrites this
+  # file in place to add the TLS listener and the 80 → 443 redirect, so writing
+  # those by hand would mean maintaining two sources of truth for the same
+  # block and would break `certbot renew`'s ability to find what it manages.
   # ---------------------------------------------------------------------------
   - path: /etc/nginx/sites-available/if-recommender
     permissions: "0644"
@@ -90,7 +99,7 @@ write_files:
       server {
           listen 80 default_server;
           listen [::]:80 default_server;
-          server_name _;
+          server_name __SERVER_NAME__;
 
           # Model weights and the ranking tables make responses large; results
           # pages are HTML tables of up to 50 rows.
@@ -124,10 +133,18 @@ runcmd:
   - set -eux
 
   # OCI's Ubuntu images ship an iptables policy that accepts established traffic
-  # and port 22, then rejects the rest — so port 80 is blocked in the OS even
-  # once the security list allows it. Insert ahead of that reject and persist.
+  # and port 22, then rejects the rest — so 80 and 443 are blocked in the OS even
+  # once the security list allows them. Insert ahead of that reject and persist.
+  # 443 is opened here even though TLS is issued later: certbot's --nginx
+  # installer reloads straight into an HTTPS listener, and an unreachable 443 at
+  # that moment looks exactly like a broken certificate.
   - iptables -I INPUT 1 -p tcp --dport 80 -m conntrack --ctstate NEW -j ACCEPT
+  - iptables -I INPUT 1 -p tcp --dport 443 -m conntrack --ctstate NEW -j ACCEPT
   - netfilter-persistent save
+
+  # One OpenMP/MKL thread per vCPU. Inference is serialised behind Gradio's
+  # queue, so intra-op parallelism is where the cores actually get used.
+  - printf 'OMP_NUM_THREADS=%s\nMKL_NUM_THREADS=%s\n' "$(nproc)" "$(nproc)" >> /etc/if-recommender-runtime.env
 
   # uv, installed system-wide rather than under ~ubuntu: the installer's default
   # is $XDG_BIN_HOME then $HOME/.local/bin, so a hardcoded per-user ExecStart path
@@ -146,6 +163,10 @@ runcmd:
   # is newest today.
   - su - ubuntu -c 'cd /opt/if-recommender && /usr/local/bin/uv sync --frozen'
 
+  # Falls back to the _ catch-all when DOMAIN is unset, so a DNS-less instance
+  # still serves on its bare IP instead of nginx rejecting every request.
+  - sed -i "s/__SERVER_NAME__/${DOMAIN:-_}/" /etc/nginx/sites-available/if-recommender
+
   - ln -sf /etc/nginx/sites-available/if-recommender /etc/nginx/sites-enabled/if-recommender
   - rm -f /etc/nginx/sites-enabled/default
   - nginx -t
@@ -153,11 +174,29 @@ runcmd:
   - systemctl daemon-reload
   - systemctl enable --now if-recommender
 
+  # certbot is installed but not run. Let's Encrypt allows 5 duplicate
+  # certificates per week, and this file gets re-run during infrastructure
+  # debugging — an automated issuance would burn that quota on instances that
+  # were never going to serve traffic. It also cannot succeed until DNS points
+  # here and the security list is open, neither of which cloud-init controls.
+  - snap install --classic certbot
+  - ln -sf /snap/bin/certbot /usr/local/bin/certbot
+
 final_message: |
   IFDB recs deployed after $UPTIME seconds.
 
-  Reachable on http://<public-ip>/ once the OCI security list allows port 80
-  (see deploy/README.md — cloud-init cannot open that for you).
+  Two manual steps remain — see deploy/README.md:
+
+    1. Open TCP 80 and 443 in the OCI security list for the public subnet.
+       cloud-init handles the OS firewall but cannot reach the VCN layer.
+
+    2. Point DOMAIN's A record at this instance, then issue the certificate:
+
+         sudo certbot --nginx -d "$(. /etc/if-recommender.env; echo $DOMAIN)"
+
+       Leave port 80 open afterwards; the HTTP-01 renewal challenge needs it.
+
+  Health checks:
 
     systemctl status if-recommender
     journalctl -u if-recommender -f
