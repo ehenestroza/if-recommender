@@ -246,15 +246,25 @@ def _rank(query_text, emb, exclude, cached):
     if not candidates:
         return [], {}
 
+    n_retrieved = len(candidates)
     if RETR.get("prefilter_by_tag", True):
         from src.pipeline.retriever import filter_by_tag_overlap
         _, query_tags = parse_profile_text(query_text)
         if query_tags:
             candidates = filter_by_tag_overlap(candidates, GAME_INFO_MAP, set(query_tags))
+    n_filtered = len(candidates)
 
     cap = RETR.get("rerank_pool_cap", 0)
     if cap and len(candidates) > cap:
         candidates = candidates[:cap]
+
+    # One line per live scoring, because pairs scored is what live latency is
+    # made of — roughly 0.8 s plus a pair count over the host's throughput. It
+    # also makes a misconfigured deployment visible from the journal: a cap that
+    # is silently zero looks exactly like a cap that is working until you notice
+    # the scored count running past it.
+    logger.info("Live scoring: retrieved %d → tag-filtered %d → scoring %d (cap %s)",
+                n_retrieved, n_filtered, len(candidates), cap or "none")
 
     return RERANKER.rerank(
         query_text=query_text,
