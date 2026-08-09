@@ -146,6 +146,18 @@ runcmd:
   # queue, so intra-op parallelism is where the cores actually get used.
   - printf 'OMP_NUM_THREADS=%s\nMKL_NUM_THREADS=%s\n' "$(nproc)" "$(nproc)" >> /etc/if-recommender-runtime.env
 
+  # The two other levers on live latency are in config.yaml rather than here,
+  # because they are properties of the pipeline and not of the instance:
+  #
+  #   retrieval.rerank_pool_cap: 1000   caps candidates scored per vibe query
+  #   model.quantize_reranker: "auto"   dynamic int8 cross-encoder
+  #
+  # "auto" is what makes this file shape-independent. Quantization measured 2.02x
+  # on x86's fbgemm and 4x *slower* on ARM's qnnpack, so auto enables it on an
+  # E-series instance and skips it on an Ampere A1 — the same config.yaml is
+  # correct on both. Confirm which path a given instance took with:
+  #   uv run scripts/measure_latency.py --quantize --json   # -> "quantized_engine"
+
   # uv, installed system-wide rather than under ~ubuntu: the installer's default
   # is $XDG_BIN_HOME then $HOME/.local/bin, so a hardcoded per-user ExecStart path
   # would break silently if either changed. UV_INSTALL_DIR pins it.
@@ -201,3 +213,8 @@ final_message: |
     systemctl status if-recommender
     journalctl -u if-recommender -f
     cd /opt/if-recommender && sudo -u ubuntu /usr/local/bin/uv run scripts/measure_memory.py
+    cd /opt/if-recommender && sudo -u ubuntu /usr/local/bin/uv run scripts/measure_latency.py
+
+  Stop the service before measuring either one: both load a second full copy of
+  the models and tables, and on a two-core instance they would otherwise be
+  competing with the app for the cores they are trying to measure.

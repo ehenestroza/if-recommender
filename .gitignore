@@ -11,3 +11,9 @@ checkpoints/
 # Raw IFDB database dumps — large, and re-downloadable from ifdb.org
 *.sql
 *.sql.gz
+
+# Per-query experiment results. Regenerable from the scripts, and the summaries
+# that matter live in NOTES.md — the raw form is megabytes that every
+# `git clone --depth 1` on a deploy would otherwise carry.
+outputs/vibe_depth.json
+outputs/quantized_quality.json

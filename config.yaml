@@ -24,6 +24,11 @@ model:
   base_model: "sentence-transformers/all-MiniLM-L6-v2"
   reranker_model: "cross-encoder/ms-marco-MiniLM-L6-v2"
   max_seq_length: 256
+  # Dynamic int8 for the cross-encoder. "auto" enables it only on backends
+  # measured to gain from it (fbgemm/x86: 2.02x); on ARM's qnnpack it measured
+  # 4x *slower*, so auto leaves it off there. true forces, false disables.
+  # Costs nothing detectable in ranking quality — see NOTES.md.
+  quantize_reranker: "auto"
 
 preprocessing:
   bayesian_prior_mean: 3.5    # assumed rating for a game with no reviews
@@ -51,7 +56,11 @@ retrieval:
   min_rerank_score: 0.10      # relevance floor; low enough to leave filter headroom, high enough to display
   top_k_retrieve: 50          # raw-retrieval evaluation only; the pipeline reranks the whole pool
   top_k_rerank: 25
-  rerank_pool_cap: 0          # max candidates scored live; 0 = no cap. Precomputed modes ignore it
+  # Max candidates scored live, applied after the tag pre-filter; 0 = no cap.
+  # Precomputed modes ignore it. 1000 is a tail control: it leaves the median
+  # query untouched and clips the worst case, at zero measured quality cost
+  # (ΔNDCG@10 = 0.0000, 0.992 page overlap over 300 users).
+  rerank_pool_cap: 1000
   prefilter_by_tag: true      # drop candidates sharing no tag with the query (measured free)
   index_type: "flat"          # "hnsw" for faster approximate search at scale
   hnsw_m: 32

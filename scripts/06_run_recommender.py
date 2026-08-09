@@ -431,6 +431,11 @@ def load_artefacts(cfg: dict):
         logger.info("Loading cross-encoder: %s …", reranker_model)
     reranker = Reranker(model_name=reranker_model)
 
+    # Quantization lives here rather than in either front-end so the web app, the
+    # CLI and the precompute job cannot disagree about what the reranker is.
+    from src.pipeline import quantize
+    quantize.apply(reranker.model, cfg["model"].get("quantize_reranker", False))
+
     # Optional bayesian_avg blending in reranker — only for games that have reviews
     bayesian_avg_map = None
     if retr_cfg.get("use_rating_reranking", False):
@@ -816,8 +821,12 @@ def run_evaluation(
             n_skipped += 1
             continue
         if rerank:
-            # Mirror the interactive path: score every candidate above the
-            # cosine threshold, so the measurement reflects what users see.
+            # Deliberately uncapped, and deliberately not `rerank_pool_cap`.
+            # This evaluates userid queries, which production serves from the
+            # precomputed tables — and those are built uncapped by
+            # 07_precompute.py, because an offline job has no latency budget to
+            # protect. The cap exists for `vibe`, the only mode scored live, so
+            # applying it here would measure something nobody is served.
             candidates = retriever.index.search(emb, min_score=min_score)
             scored, _ = reranker.rerank(
                 query_text=profile_map.get(uid, ""),

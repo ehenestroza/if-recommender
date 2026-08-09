@@ -99,7 +99,9 @@ Two properties are deliberate:
 
 *The rating term is deliberately the weaker one.* Bayesian smoothing squeezes ratings into roughly 0.54–0.81 while relevance spans nearly 0–1, so rating moves the score about 3× less than its weight implies. That imbalance is load-bearing — see [the blend experiment](#the-rating-blend).
 
-**Whole-pool reranking.** The reranker scores every candidate above the retrieval threshold, not a truncated slice. Cosine rank and cross-encoder rank correlate only weakly (Spearman ρ ≈ 0.22), so truncating first discards most of what the reranker would have picked.
+**Deep reranking, capped at the tail.** The reranker scores every candidate above the retrieval threshold up to `rerank_pool_cap` (1,000), applied after the tag pre-filter. Cosine rank and cross-encoder rank correlate only weakly (Spearman ρ ≈ 0.22), so truncating aggressively discards most of what the reranker would have picked — but a median vibe pool is 580 candidates, so the cap binds only on the long tail and leaves the typical query scored end to end. See [the cap experiment](#where-the-cap-belongs-and-what-it-costs) for what it costs, which is nothing measurable.
+
+The bi-encoder is doing the pruning either way: a threshold rather than a top-K, but it still takes 10,087 games down to a median of 927 before the cross-encoder sees anything.
 
 ---
 
@@ -200,6 +202,70 @@ Cosine rank and cross-encoder rank barely agree (Spearman ρ ≈ 0.22), so reran
 
 But depth turns out not to be a quality lever. Over 200 held-out users with paired bootstrap CIs, 50 → 200 candidates moves NDCG@25 by +0.002 (interval spans zero) and 200 → 800 is flat to slightly negative. What depth buys is *consistency*: with the whole pool scored, a filter narrows a fixed ranking instead of changing which candidates were scored at all.
 
+### Where the cap belongs, and what it costs
+
+Depth was revisited when `vibe` turned out to be the only mode a visitor waits on, and revisiting it settled where `rerank_pool_cap` should sit.
+
+Vibe queries have no ground truth of their own, so 300 held-out users' profiles were truncated to menu-style picks — the shape the UI produces — and scored against their test-split positives at every cap from 50 to 1,500. Because a cross-encoder score depends only on its own (query, document) pair, every cap is derived from one full scoring per query rather than rescored; `scripts/verify_cap_equivalence.py` checks that derivation against genuinely capped runs, ID for ID.
+
+Quality confirms the earlier finding and extends it — nothing above 300 is distinguishable from scoring everything:
+
+| Cap | Recall@10 | NDCG@10 | ΔNDCG@10 (95% CI) |
+|---|---|---|---|
+| 100 | 0.1779 | 0.1149 | −0.0165 [−0.0375, +0.0031] |
+| 200 | 0.1799 | 0.1158 | −0.0155 [−0.0339, +0.0007] |
+| 300 | 0.1918 | 0.1269 | −0.0045 [−0.0149, +0.0040] |
+| 500 | 0.1979 | 0.1317 | +0.0003 [−0.0084, +0.0072] |
+| 1,000 | 0.2005 | 0.1314 | +0.0000 [+0.0000, +0.0000] |
+| whole pool | 0.2005 | 0.1314 | — |
+
+Consistency is where the cap is actually paid for, and it degrades far faster than quality does:
+
+| Cap | overlap@25 vs whole pool | top-1 same | identical pages |
+|---|---|---|---|
+| 200 | 0.558 | 56% | 13% |
+| 300 | 0.697 | 72% | 25% |
+| 500 | 0.854 | 84% | 49% |
+| 750 | 0.957 | 94% | 72% |
+| 1,000 | 0.992 | 99% | 95% |
+
+**1,000 is a tail control, not a throughput control.** The pool is smaller than it looks — a median of 927 candidates clear the cosine floor and 580 survive the tag pre-filter — so capping at 1,000 leaves the median query untouched and cuts only 2% of mean scoring work. What it does is bound the worst case: p99 pool 1,387 → 1,000, which on the deployment VM is 32 s → 24 s before quantization. It costs nothing measurable on either axis, which is the whole argument for it.
+
+Going lower does buy real time (500 puts every query under 12.5 s), but 0.854 overlap means about 15% of the page moves. Since depth was never a quality lever, that cost is entirely in reproducibility — worth knowing before trading it for latency.
+
+The cap is applied **after** the tag pre-filter in both front-ends. At the same K that dominates capping the raw cosine list: it spends the budget on candidates that survived the filter, and measured better at every cap (0.854 vs 0.750 overlap@25 at 500).
+
+### int8 quantization of the cross-encoder
+
+Dynamic quantization is the only lever here that shortens the *median* query rather than the tail: it scales all scoring by a constant, so unlike a cap it does not work by discarding candidates. Weights are stored as int8 and activations quantized per batch, with no calibration set and no retraining.
+
+Quality is unaffected. Over 150 queries and 147,619 scored pairs, with both models scoring the same pools so the comparison is paired:
+
+| Metric | fp32 | int8 | Δ (95% CI) |
+|---|---|---|---|
+| Recall@10 | 0.2025 | 0.2083 | +0.0058 [−0.0025, +0.0200] |
+| Recall@25 | 0.2654 | 0.2570 | −0.0083 [−0.0267, +0.0033] |
+| NDCG@10 | 0.1215 | 0.1224 | +0.0010 [−0.0062, +0.0078] |
+| NDCG@25 | 0.1381 | 0.1360 | −0.0020 [−0.0093, +0.0042] |
+| MRR | 0.1054 | 0.1044 | −0.0010 [−0.0098, +0.0060] |
+
+Every interval spans zero and the point estimates fall on both sides of it — the signature of a change that perturbs scores without systematically degrading the ranking. Relevance scores move 0.0245 on average (max 0.242), enough to reshuffle near-ties and not enough to reorder anything that matters. The visible cost is page churn: **0.936 overlap@25**, top-1 unchanged for 92% of queries, mean displacement 1.84 positions. That is roughly what capping at 750 costs, except that a cap discards candidates while this only jitters the order of ones it kept.
+
+**Speed is a property of the host, not the model**, by a factor large enough to invert the decision:
+
+| Backend | Machine | pairs/s | |
+|---|---|---|---|
+| fbgemm | deployment VM (x86, 2 vCPU) | 45 → 92 | **2.02×** |
+| qnnpack | Apple M-series laptop | 149 → 36 | **0.24×** |
+
+Hence `model.quantize_reranker: "auto"`, which consults the backend rather than trusting a boolean: it enables quantization on fbgemm and skips it on qnnpack, so one config.yaml is correct on an E-series instance and on an Ampere A1. Quantized kernels are also CPU-only, so it skips (loudly) when the model has landed on MPS or CUDA.
+
+One trap is worth recording, because it fails silently. `CrossEncoder.model` is a property proxying to `ce[0].auto_model`, and `nn.Module.__setattr__` intercepts Module assignments before the property setter runs — so assigning to either registers an unused second child and leaves the module `forward()` calls in fp32. Inference keeps working and returns *bit-identical* scores, which reads as "quantization changed nothing" rather than as a bug. The correct target is `ce[0].model`, and `src/pipeline/quantize.py` asserts the live module converted so it cannot recur.
+
+Two caveats on adopting it. The quality numbers above were measured under qnnpack; fbgemm applies `reduce_range` on x86 and its error profile differs slightly, so re-running `scripts/exp_quantized_quality.py` on the target host gives the figure that actually applies. And `torch.ao.quantization` is deprecated as of torch 2.11 with removal signalled — the migration path is torchao.
+
+int8 also pushes about 3% more candidates below the `min_rerank_score` floor, trimming filter headroom. Harmless against a median stored depth of ~510, but it compounds with a cap.
+
 ### The rating blend
 
 Two variants tested over 300 users:
@@ -288,15 +354,28 @@ Rows stream to Parquet in batches and publish by atomic rename, so a reader neve
 
 **Re-run this after retraining anything**, or the app serves stale rankings.
 
+Precompute ignores `rerank_pool_cap` — an offline job has no latency budget to protect, so these tables are built over the whole pool. It does pick up `quantize_reranker` through the shared loader, which on an x86 host halves the run. The tables currently shipped were built fp32; regenerating them under int8 is optional rather than required, since quality is unchanged either way.
+
 Not everything is deep: 3.2% of users, 8.7% of games and 9.1% of authors have fewer than 25 stored results, so a UI should report the true count rather than implying a full page.
 
 ### Resources
 
 **Memory ~1.5 GB** with everything resident — dataframes, FAISS index, embeddings, both models and all three lookup tables.
 
-**CPU is the real constraint.** The cross-encoder runs at ~135 pairs/s on two threads; a free-tier vCPU is plausibly 1.5–3× slower. That budget is fixed and shared, so concurrent requests divide it. Serialising inference (`concurrency_limit=1`) makes contention a visible queue rather than everyone slowing down at once.
+**CPU is the real constraint**, and it is worth measuring rather than estimating: an Apple M-series laptop runs the cross-encoder at ~145 pairs/s on two threads, while the 2-vCPU OCI instance runs it at 45 — a 3.2× gap that no amount of reasoning about "a free-tier vCPU" would have pinned down. `scripts/measure_latency.py` reports it for a given host. That budget is fixed and shared, so concurrent requests divide it. Serialising inference (`concurrency_limit=1`) makes contention a visible queue rather than everyone slowing down at once.
 
-Only `vibe` consumes CPU, and it is cached two ways: per session while a user narrows filters, and process-wide across users keyed by (systems, tags). A repeat vibe query costs 0.02 s against 4 s cold. The cache holds 2,048 entries at ~85 KB each, about 171 MB.
+Latency is close to linear in candidates scored, which makes it projectable. On the deployment VM:
+
+```
+fp32   t = 1.45 s + pairs / 45.2
+int8   t = 0.82 s + pairs / 91.5
+```
+
+Both fit within 0.5 s across pools from 174 to 1,390 pairs. Note the fixed term: ~1 s of every query is setup that no amount of pool trimming touches, which is why capping below ~300 candidates stops paying for itself.
+
+With `rerank_pool_cap: 1000` and int8 on fbgemm, a cold vibe query runs **6–7 s typical and 11.7 s worst case**, against 12–14 s / 38 s uncapped and unquantized. The cap does the tail and the quantization does the median; neither substitutes for the other.
+
+Only `vibe` consumes CPU, and it is cached two ways: per session while a user narrows filters, and process-wide across users keyed by (systems, tags). A repeat vibe query costs 0.02 s against several seconds cold. The cache holds 2,048 entries at ~85 KB each, about 171 MB.
 
 The number worth watching in production is neither the cache nor the models: PyTorch's allocator grew ~470 MB across 28 scorings in testing and had not clearly plateaued, and it does so whether or not results are cached. A larger cache *reduces* that pressure, since every hit is a scoring that never runs.
 
