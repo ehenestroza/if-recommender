@@ -94,6 +94,36 @@ class Reranker:
 # Post-rerank diversity
 # ---------------------------------------------------------------------------
 
+def order_by_relevance(
+    scored: List[Tuple[str, float]],
+    relevance: Dict[str, float],
+) -> List[Tuple[str, float]]:
+    """
+    Re-key a score-ordered pool onto relevance, for display.
+
+    The blended score still decides *which* candidates exist: it is what
+    `min_rerank_score` filtered on and what every top-N truncation upstream was
+    applied to, both here and in the precomputed tables. This decides only the
+    order they are shown in.
+
+    It swaps the value carried in each pair rather than sorting after the fact,
+    so everything downstream reads relevance too — the author cap in
+    `diversify_results` keeps an author's most *relevant* game rather than their
+    best-rated one, and the coverage pass and its final sort agree with what the
+    reader sees.
+
+    Sorting is stable, so ties keep the pool's existing order, which is score.
+    Among equally relevant games the better-rated one still comes first — a
+    tiebreak rather than a thumb on the scale.
+
+    Shared by the CLI and the web app so the two cannot show different orders.
+    """
+    return sorted(
+        ((gid, relevance.get(gid, 0.0)) for gid, _ in scored),
+        key=lambda pair: -pair[1],
+    )
+
+
 def select_results(
     scored: List[Tuple[str, float]],
     hard_filters: Optional[dict],

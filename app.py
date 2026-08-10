@@ -37,7 +37,7 @@ from src.data.preprocessor import (
 from src.data.pickers import (
     EXCLUDED_AUTHORS, author_choices, game_choices, reviewer_choices, vocab_choices,
 )
-from src.pipeline.ranker import select_results
+from src.pipeline.ranker import order_by_relevance, select_results
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s | %(message)s")
 logger = logging.getLogger(__name__)
@@ -48,12 +48,17 @@ IFDB_GAME_URL = "https://ifdb.org/viewgame?id={gameid}"
 # promise the latter.
 MODES = ["game", "author", "reviewer", "vibe"]
 
-RESULT_COLUMNS = ["#", "score", "relevance", "rating", "title",
+# Field order within a card. Also the DataFrame's column order, so the two
+# cannot drift. There is no column-width table any more: results render as
+# cards at every width, so nothing is apportioning a fixed share of a row.
+#
+# The blended score is deliberately absent. It answered "match plus quality" in
+# one number that nobody could decompose, and ordering by it pushed already
+# well-loved games up — the opposite of what a discovery tool is for. Relevance
+# alone is what a reader can act on, and rating is right there beside it for
+# anyone who wants to weigh it themselves.
+RESULT_COLUMNS = ["#", "relevance", "rating", "title",
                   "author", "year", "system", "genre", "tags"]
-# Relevance needs room for the word itself, and genre truncates badly below
-# ~12%. The narrow numeric columns carry a little slack so their headers still
-# fit on one line once a sort arrow appears beside them.
-COLUMN_WIDTHS = ["4%", "6%", "8%", "8%", "13%", "9%", "6%", "9%", "12%", "25%"]
 PAGE_SIZES = [10, 25, 50]
 SCROLL_TO_SUMMARY = ("() => { const el = document.getElementById('summary');"
                      " if (el) el.scrollIntoView({behavior: 'smooth', block: 'start'}); }")
@@ -65,11 +70,14 @@ ANY_LABEL = "any"
 # 2,048 is roughly 171 MB against a 1.5 GB baseline in a 16 GB box. Raising it
 # also reduces allocator churn, since every hit is a scoring that never runs.
 BROWSE_CACHE_SIZE = 2_048
-SEARCH_HINT = "start typing to search"
 # The big pickers ship every option to the browser, so the first open costs a
 # moment of client-side rendering. That is browser work, not server work — it
 # does not compete with scoring.
-BIG_HINT = "start typing to search · {n}K options, first open takes a second"
+#
+# "type to search" rather than "start typing to search": the hint sits under a
+# label on a phone, where the saved characters are the difference between one
+# line and two.
+BIG_HINT = "type to search · {n}K options, first open takes a second"
 PICK_HINT = "choose one or more"
 # The four text-valued filters all accept a typed fragment and match by
 # substring, so they carry the same hint — documenting it on only one would
@@ -77,6 +85,16 @@ PICK_HINT = "choose one or more"
 FREE_TEXT_HINT = "type text fragments and press return · case insensitive"
 RATING_CHOICES = [round(0.5 * i, 1) for i in range(10)]      # 0.0 … 4.5
 RATING_COUNT_CHOICES = [0, 1, 2, 5, 10, 25, 50]
+
+TAGLINE = "find your next interactive fiction game"
+
+REPO_URL = "https://github.com/ehenestroza/if-recommender"
+# Rendered with sanitize_html=False so target/rel survive. Safe because this is
+# a literal constant — nothing user-supplied reaches it.
+FOOTER_HTML = (
+    f'by Enrique · <a href="{REPO_URL}" target="_blank" rel="noopener">'
+    f'source on GitHub</a>'
+)
 
 # Longest values a cell may show before trailing off. Tags and multi-author
 # credits are unbounded in the source data and will otherwise blow up row height.
@@ -88,20 +106,88 @@ CLIP = {"author": 34, "tags": 170, "genre": 46, "system": 26}
 # Do not try to remove the results table's inner scrollbar. The component
 # virtualises rows against its scroll container, so both a huge max_height and a
 # CSS height:auto override stop most rows from rendering at all.
+#
+# Results are cards at every width — there is no tabular mode. Ten columns only
+# ever fitted a maximised laptop window, and every width below that spent its
+# budget wrapping each value onto three lines. A card gives every field a whole
+# line and lets the page grow downwards instead, which is the axis a browser has
+# to spare.
+#
+# Width buys *columns of cards* rather than narrower cells: one up to 1024px,
+# two to 1600px, three above. The grid lives on `tbody`, so ordering is the
+# browser's default row-major flow — result 1 top-left, result 2 to its right —
+# and rank stays readable left-to-right the way a numbered list should.
+#
+# `align-items: start` keeps a short card from stretching to match a tall
+# neighbour. Rows still take the height of their tallest card, which is what
+# grid does; the alternative is a masonry layout whose reading order is column-
+# major, and that would break the numbering.
+#
+# The remaining @media block is 768px, and it is about touch rather than
+# results: bigger tap targets, 16px inputs, filters two-up, tighter padding.
+# Keeping it separate from the card breakpoints is what lets an intermediate
+# window get desktop controls with a one- or two-column card grid.
+#
+# Details that are load-bearing:
+#   * the 1fr track is minmax(0, 1fr) — a bare 1fr floors at max-content, so a
+#     long tag list overflows the card instead of wrapping inside it
+#   * td:empty is hidden, or a field the game lacks renders as a label with
+#     nothing beside it, which reads as missing data rather than absent
+#   * 16px inputs, below which iOS Safari zooms on focus and stays zoomed
+#   * `order` pulls rank and title ahead of the relevance and rating fields
+#     that precede them in the DOM, so the card leads with what identifies
+#     the game rather than with its numbers
+#
+# The filter selectors go through `.control-row > * > *` rather than the more
+# obvious `.control-row > *`. Gradio wraps consecutive form components in an
+# implicit `form` component, so a row of four dropdowns has exactly one child —
+# sizing that child to 50% squeezes all four filters into half the row instead
+# of giving each a half. The extra level is the wrapper, not decoration.
+#
+# min-width:0 on their descendants because Gradio's own component CSS carries
+# min-widths up to 200px; two of those in one row exceed a 360px phone.
 CSS = """
 :root, .gradio-container { font-family: "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace !important; }
-.gradio-container { max-width: 100% !important; padding: 1.2em 1.6em !important; }
-h1 { font-weight: 600 !important; letter-spacing: -0.01em; margin-bottom: 0.5em !important; }
-.gr-button { border-radius: 2px !important; }
-input, textarea, select { border-radius: 2px !important; }
-#results .results-table { width: 100%; border-collapse: collapse; table-layout: fixed;
-  font-size: 1em; margin-top: 0.4em; }
-#results .results-table th, #results .results-table td { text-indent: 0 !important; }
-#results .results-table th { text-align: left; font-weight: 600; opacity: 0.75;
-  padding: 0.45em 0.5em; border-bottom: 1px solid rgba(128,128,128,0.45); }
-#results .results-table td { vertical-align: top; padding: 0.4em 0.5em;
-  border-bottom: 1px solid rgba(128,128,128,0.18); word-wrap: break-word; }
-#results .results-table tr:hover td { background: rgba(128,128,128,0.09); }
+.gradio-container { max-width: 100% !important; padding: 1.2em 1.6em !important;
+  --block-radius: 10px; --block-border-width: 1px;
+  --block-border-color: rgba(128,128,128,0.16);
+  --block-shadow: none; --block-label-shadow: none;
+  --border-color-primary: rgba(128,128,128,0.07);
+  --border-color-secondary: rgba(128,128,128,0.07);
+  --input-radius: 8px; --input-border-color: rgba(128,128,128,0.22);
+  --button-large-radius: 8px; --button-small-radius: 6px;
+  --button-primary-shadow: none; --button-secondary-shadow: none; }
+h1 { font-weight: 600 !important; letter-spacing: -0.01em; margin-bottom: 0.15em !important; }
+#tagline { margin: 0 0 1.1em !important; }
+#tagline p { margin: 0 !important; font-size: 1em !important; letter-spacing: 0.01em;
+  color: var(--body-text-color-subdued) !important; }
+#results .results-table { width: 100%; display: block; font-size: 1em; margin-top: 0.6em; }
+#results .results-table td { text-indent: 0 !important; }
+#results .results-table tbody { display: grid; gap: 0.75em; align-items: start;
+  grid-template-columns: minmax(0, 1fr); }
+#results .results-table tr { display: flex; flex-wrap: wrap; align-items: baseline;
+  border: 1px solid rgba(128,128,128,0.18); border-radius: 10px;
+  padding: 0.7em 0.85em; margin: 0; }
+#results .results-table tr:hover { border-color: rgba(128,128,128,0.34); }
+#results .results-table td { display: grid; grid-template-columns: 6rem minmax(0, 1fr);
+  gap: 0.5em; flex: 1 1 100%; min-width: 0; border: none; padding: 0.18em 0;
+  line-height: 1.5; overflow-wrap: break-word; }
+#results .results-table td::before { content: attr(data-label); opacity: 0.45;
+  font-size: 0.85em; letter-spacing: 0.04em; }
+#results .results-table td:empty { display: none; }
+#results .results-table td[data-label="#"],
+#results .results-table td[data-label="title"] {
+  display: block; flex: 0 1 auto; padding-bottom: 0.3em; }
+#results .results-table td[data-label="#"]::before,
+#results .results-table td[data-label="title"]::before { content: none; }
+#results .results-table td[data-label="#"] { order: -2; opacity: 0.4; margin-right: 0.55em; }
+#results .results-table td[data-label="title"] { order: -1; flex: 1 1 auto; font-size: 1.05em; }
+@media (min-width: 1024px) {
+  #results .results-table tbody { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0.85em; }
+}
+@media (min-width: 1600px) {
+  #results .results-table tbody { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+}
 #results .results-table a { text-decoration: none; font-weight: 600; display: inline !important;
   text-indent: 0 !important; padding: 0 !important; margin: 0 !important; border: none !important; }
 #results .results-table a::before, #results .results-table a::after { content: none !important; display: none !important; }
@@ -110,25 +196,58 @@ input, textarea, select { border-radius: 2px !important; }
 #filters-head { align-items: center !important; gap: 0.6em !important; flex-wrap: nowrap !important;
   padding: 0 !important; margin: 0 !important; }
 #filters-head > * { flex: 0 0 auto !important; width: auto !important; min-width: 0 !important; }
-#clear-filters { background: none !important; border: none !important; box-shadow: none !important;
+#reset-filters { background: none !important; border: none !important; box-shadow: none !important;
   text-decoration: underline; opacity: 0.55; padding: 0 !important; min-width: 0 !important;
-  font-size: 0.85em !important; position: relative; top: 0.18em; }
-#clear-filters:hover { opacity: 1; }
+  font-size: 0.9em !important; position: relative; top: 0.05em; }
+#reset-filters:hover { opacity: 1; }
 /* Darker than the block body so a header does not read as an editable field. */
-.block-header { padding: 0.35em 0 0.35em 0.7em !important; margin: 0 !important; opacity: 0.9;
-  background: rgba(0,0,0,0.16) !important; border: none !important; border-radius: 0 !important;
-  letter-spacing: 0.02em; }
-#filters-head { background: rgba(0,0,0,0.16) !important; }
-#filters-head .block-header { background: none !important; }
+.block-header { padding: 0.65em 0 0.6em 0.85em !important; margin: 0 !important;
+  background: var(--block-background-fill) !important; border: none !important;
+  border-bottom: 1px solid rgba(128,128,128,0.14) !important;
+  border-radius: 10px 10px 0 0 !important; letter-spacing: 0.03em; }
+.block-header p, .block-header span { font-size: 1.05em !important; opacity: 0.62; }
+#filters-head { background: var(--block-background-fill) !important;
+  border-radius: 10px 10px 0 0 !important;
+  border-bottom: 1px solid rgba(128,128,128,0.14) !important; }
+#filters-head .block-header { border-bottom: none !important; border-radius: 0 !important; }
+#filters-head .block-header { background: none !important; border-radius: 0 !important; }
 /* Padding in rem, not em: em would be relative to this element's own font
    size, so changing the text size would silently shift the indent too. */
 /* Page background, not the group's fill, so the line does not read as an input.
    Uses the theme variable so it stays correct in dark mode too. */
-.filter-hint { padding: 0.5em 0 0.5em 0.62rem !important; margin: 0 !important; opacity: 0.5;
-  background: var(--body-background-fill, #fff) !important; }
+.filter-hint { padding: 0.55em 0 0.6em 0.85rem !important; margin: 0 !important;
+  background: var(--block-background-fill) !important; }
 /* Size the text only, never the wrapper too — em on both compounds. */
-.filter-hint p, .filter-hint span { font-size: 0.92em !important; line-height: 1.3 !important; }
+.filter-hint p, .filter-hint span { font-size: 0.92em !important; line-height: 1.3 !important;
+  opacity: 0.45; }
 footer { display: none !important; }
+#page-footer { margin-top: 2.2em !important; padding: 1em 0 0.4em !important;
+  border-top: 1px solid rgba(128,128,128,0.14) !important; }
+#page-footer p { margin: 0 !important; font-size: 0.9em !important;
+  letter-spacing: 0.02em; color: var(--body-text-color-subdued) !important; }
+#page-footer a { color: inherit !important; text-decoration: underline;
+  text-underline-offset: 3px; }
+#page-footer a:hover { color: var(--body-text-color) !important; }
+
+@media (max-width: 768px) {
+  .gradio-container { box-sizing: border-box !important; padding: 0.8em 0.7em !important; }
+  input, textarea, select { font-size: 16px !important; }
+  .control-row *, #action-row * { min-width: 0 !important; }
+  .control-row, .control-row > * { flex-wrap: wrap !important; }
+  .control-row > * {
+    display: flex !important; flex: 1 1 100% !important; max-width: 100% !important;
+    gap: 0.5em !important;
+  }
+  .control-row > * > * {
+    flex: 1 1 calc(50% - 0.35em) !important;
+    max-width: calc(50% - 0.35em) !important;
+  }
+  #action-row { flex-wrap: wrap !important; }
+  #action-row > * { flex: 1 1 100% !important; max-width: 100% !important; }
+  .gr-button { min-height: 44px !important; }
+  #reset-filters { min-height: 0 !important; }
+}
+
 """
 
 
@@ -205,9 +324,17 @@ SYSTEM_CHOICES, TAG_CHOICES = vocab_choices(GAME_DOCS)
 (GENRE_FILTER_CHOICES, SYSTEM_FILTER_CHOICES, AUTHOR_FILTER_CHOICES,
  TAG_FILTER_CHOICES, YEAR_CHOICES) = _filter_choices()
 YEAR_MAX, YEAR_MIN = YEAR_CHOICES[0], YEAR_CHOICES[-1]
-# The value each filter holds when it is filtering nothing. Defined once so the
-# initial state and the reset button cannot drift apart.
-FILTER_DEFAULTS = ([], [], [], [], 0, 0, YEAR_MIN, YEAR_MAX)
+# What each filter holds on load, and what the reset button restores. Defined
+# once so the two cannot drift apart.
+#
+# Rating and count are the only two that start switched on, and they are the
+# counterweight to ordering by relevance alone. A page led by unrated games asks
+# the reader to gamble with no information, and 2.x games occupy slots that a
+# merely-decent game could have used to spark interest. 3.0 with at least one
+# rating clears both without being a quality bar in any real sense — and because
+# `min_rating` also drops games nobody has rated, lowering rating to 0.0 is what
+# opens the genuinely unknown tail to anyone who wants it.
+FILTER_DEFAULTS = ([], [], [], [], 3.0, 1, YEAR_MIN, YEAR_MAX)
 
 
 # ---------------------------------------------------------------------------
@@ -315,28 +442,29 @@ def _table_update(frame):
     """
     if frame.empty:
         return ""
-    cols = "".join(f'<col style="width:{w}">' for w in COLUMN_WIDTHS)
-    head = "".join(f"<th>{escape(c)}</th>" for c in RESULT_COLUMNS)
     body = []
     for row in frame.itertuples(index=False):
         cells = []
         for name, value in zip(RESULT_COLUMNS, row):
             # `title` arrives pre-built as a link; everything else is escaped text.
-            cells.append(f"<td>{value if name == 'title' else escape(str(value))}</td>")
+            text = value if name == "title" else escape(str(value))
+            # data-label carries the column name into each cell so the narrow
+            # layout can label it. A ten-column table cannot stay a table on a
+            # phone, and once the header row is gone every value needs to say
+            # what it is. Costs one attribute per cell and nothing on desktop.
+            cells.append(f'<td data-label="{escape(name, quote=True)}">{text}</td>')
         body.append("<tr>" + "".join(cells) + "</tr>")
-    return (f'<table class="results-table"><colgroup>{cols}</colgroup>'
-            f"<thead><tr>{head}</tr></thead><tbody>{''.join(body)}</tbody></table>")
+    return f'<table class="results-table"><tbody>{"".join(body)}</tbody></table>'
 
 
 def _page_table(results, relevance, page, per_page):
     start = page * per_page
     rows = []
-    for rank, (gid, score) in enumerate(results[start : start + per_page], start=start + 1):
+    for rank, (gid, _value) in enumerate(results[start : start + per_page], start=start + 1):
         row = META.loc[gid].to_dict() if gid in META.index else {}
         rel = relevance.get(gid)
         rows.append([
             rank,
-            f"{score:.2f}",
             "–" if rel is None else f"{rel:.2f}",
             pipeline._rating_cell(row),
             (f'<a href="{IFDB_GAME_URL.format(gameid=gid)}" target="_blank" '
@@ -485,7 +613,7 @@ def recommend(state, mode, game, author, user, systems, tags,
     targets = pipeline._parse_profile_targets(query_text) if mode != "vibe" else (set(), set())
     # Ask for every result the pool can yield, then paginate locally.
     results = select_results(
-        scored, hard_filters, GAME_INFO_MAP, len(scored),
+        order_by_relevance(scored, relevance), hard_filters, GAME_INFO_MAP, len(scored),
         use_diversity=RETR.get("use_diversity", True),
         target_genres=targets[0], target_systems=targets[1],
     )
@@ -527,6 +655,7 @@ def _visibility(mode):
 def build_ui():
     with gr.Blocks(title="IFDB recs") as demo:
         gr.Markdown("# IFDB recs")
+        gr.Markdown(TAGLINE, elem_id="tagline")
         state = gr.State({"results": [], "scored": [], "relevance": {},
                           "query_key": None, "page": 0, "per_page": 25})
 
@@ -550,9 +679,11 @@ def build_ui():
         with gr.Group():
             with gr.Row(elem_id="filters-head"):
                 gr.Markdown("result filters", elem_classes="block-header")
-                clear_filters = gr.Button("( clear )", size="sm", elem_id="clear-filters")
+                reset_filters = gr.Button("( reset )", size="sm", elem_id="reset-filters")
             gr.Markdown(FREE_TEXT_HINT, elem_classes="filter-hint")
-            with gr.Row():
+            # elem_classes rather than Gradio's own row class: the internal names
+            # are not API and have changed between majors, whereas these are ours.
+            with gr.Row(elem_classes="control-row"):
                 # Every filter defaults to a no-op, so an untouched block filters
                 # nothing and each control can be returned to that state.
                 # allow_custom_value lets someone type a fragment and press
@@ -571,13 +702,13 @@ def build_ui():
                 f_tags = gr.Dropdown(TAG_FILTER_CHOICES, value=FILTER_DEFAULTS[3], label="tags",
                                      multiselect=True,
                                      filterable=True, allow_custom_value=True)
-            with gr.Row():
+            with gr.Row(elem_classes="control-row"):
                 f_rating = gr.Dropdown(RATING_CHOICES, value=FILTER_DEFAULTS[4], label="rating ≥")
                 f_count = gr.Dropdown(RATING_COUNT_CHOICES, value=FILTER_DEFAULTS[5], label="rating count ≥")
                 f_year_from = gr.Dropdown(YEAR_CHOICES, value=FILTER_DEFAULTS[6], label="year ≥")
                 f_year_to = gr.Dropdown(YEAR_CHOICES, value=FILTER_DEFAULTS[7], label="year ≤")
 
-        with gr.Row():
+        with gr.Row(elem_id="action-row"):
             per_page = gr.Dropdown(PAGE_SIZES, value=25, label="results per page", scale=1)
             go = gr.Button("recommend", variant="primary", scale=3)
 
@@ -590,11 +721,15 @@ def build_ui():
             pager = gr.Markdown()
             nxt = gr.Button("next ▶", scale=1)
 
+        # A div, not a <footer>: the CSS hides Gradio's own footer by tag name,
+        # and a semantic element here would be hidden along with it.
+        gr.Markdown(FOOTER_HTML, elem_id="page-footer", sanitize_html=False)
+
         filter_controls = [f_genre, f_system, f_author, f_tags,
                            f_rating, f_count, f_year_from, f_year_to]
         # Resets the controls only; the results on screen stay until the user
         # asks for them again, so nothing changes under them unexpectedly.
-        clear_filters.click(lambda: FILTER_DEFAULTS, None, filter_controls)
+        reset_filters.click(lambda: FILTER_DEFAULTS, None, filter_controls)
 
         mode.change(_visibility, mode, [game, author, user, systems, tags])
         inputs = [state, mode, game, author, user, systems, tags,

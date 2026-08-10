@@ -73,6 +73,9 @@ game document ──► [ doc encoder   ]──► 384d ─┘
                                                     │
                           ──► [ cross-encoder reranker ]──► scored pool (cached)
                                                     │
+                                        reordered by relevance
+                                        (score selected the pool)
+                                                    │
                                               hard filters
                                                     │
                                         diversity: ≤2 per author,
@@ -91,7 +94,13 @@ game document ──► [ doc encoder   ]──► 384d ─┘
 final_score = (1 - rating_weight) * relevance + rating_weight * (bayesian_avg / 5)
 ```
 
-Relevance answers "does this match?" and knows nothing about quality; the rating term supplies what the cross-encoder cannot see. Both are shown separately in the results.
+Relevance answers "does this match?" and knows nothing about quality; the rating term supplies what the cross-encoder cannot see.
+
+**The blend selects; relevance orders.** `final_score` decides which candidates survive — it is what `min_rerank_score` filters on and what every top-N truncation is applied to, including the precomputed tables. It is not shown, and results are not ordered by it. The displayed ranking is relevance alone, with the raw community rating beside it.
+
+Two reasons. A single number combining match and popularity could not be read as either, so nobody could tell why a game placed where it did. And ordering by it worked against the point of the tool: measured on `twine + horror, romance`, ordering by score gives a top-25 averaging 4.39 stars, while ordering by relevance gives 3.67 — the same candidates, but the well-loved ones no longer float to the top of a list whose job is to surface things you have not played.
+
+`order_by_relevance` in `src/pipeline/ranker.py` does the re-keying, and both front-ends call it, so the CLI and the web app cannot show different orders. It swaps the value carried in each pair rather than sorting afterwards, so `diversify_results` reads relevance too — the author cap keeps an author's most relevant game rather than their best-rated one.
 
 Two properties are deliberate:
 

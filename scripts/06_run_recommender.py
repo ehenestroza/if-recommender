@@ -56,7 +56,8 @@ from src.data.pickers import (
 from src.utils.prompts import (
     HAS_PROMPT_TOOLKIT, Cancelled, Quit, choose, pick_many, pick_one, read_line,
 )
-from src.pipeline.ranker import Reranker, evaluate_retrieval, select_results
+from src.pipeline.ranker import (
+    Reranker, evaluate_retrieval, order_by_relevance, select_results)
 from src.pipeline.retriever import apply_hard_filters, filter_by_tag_overlap
 
 logger = logging.getLogger(__name__)
@@ -104,14 +105,13 @@ def _rating_suffix(row: dict) -> str:
 
 
 def _game_row_cells(
-    gid: str, score: str, meta: pd.DataFrame, relevance: Optional[dict] = None
+    gid: str, meta: pd.DataFrame, relevance: Optional[dict] = None
 ) -> tuple:
     """Return display cells for one game row, in `_add_game_columns` order."""
     # Convert Series → plain dict so subsequent .get() calls return scalars.
     row: dict = meta.loc[gid].to_dict() if gid in meta.index else {}
     rel = relevance.get(gid) if relevance else None
     return (
-        score,
         "–" if rel is None else f"{rel:.2f}",
         _rating_cell(row),
         str(row.get("title", gid)),
@@ -129,11 +129,11 @@ def _add_game_columns(table) -> None:
     """
     Add the game columns, in the web app's order.
 
-    Score first, then the two numbers it is made of, then the game itself — so
-    the trade-off between relevance and rating sits next to the score it explains
-    rather than at the far end of a wide table.
+    Relevance leads, then rating, then the game itself. The blended score used
+    to come first; it is no longer shown in either front-end, because one number
+    combining match and popularity could not be read as either and ordering by
+    it favoured games that are already well known.
     """
-    table.add_column("score",     style="cyan",       width=6)
     table.add_column("relevance", style="green",      width=9)
     table.add_column("rating",    style="magenta",    width=10)
     table.add_column("title",     style="bold white", min_width=24)
@@ -163,20 +163,20 @@ def print_results(
         table = Table(show_lines=True)
         table.add_column("#", style="dim", width=4)
         _add_game_columns(table)
-        for rank, (gid, score) in enumerate(results, start=1):
-            table.add_row(str(rank), *_game_row_cells(gid, f"{score:.2f}", meta, relevance))
+        for rank, (gid, _value) in enumerate(results, start=1):
+            table.add_row(str(rank), *_game_row_cells(gid, meta, relevance))
         console.print(table)
     else:
         print()
         print("-" * 80)
-        for rank, (gid, score) in enumerate(results, start=1):
+        for rank, (gid, _value) in enumerate(results, start=1):
             row: dict = meta.loc[gid].to_dict() if gid in meta.index else {}
             rating_str = _rating_suffix(row)
             year = row.get("year", "")
             year_str = f" {year}" if year else ""
             rel = relevance.get(gid) if relevance else None
-            rel_str = f" rel {rel:.2f}" if rel is not None else ""
-            print(f"  {rank:2d}. [{score:.2f}]{rel_str} {row.get('title', gid)} "
+            rel_str = f"[{rel:.2f}] " if rel is not None else ""
+            print(f"  {rank:2d}. {rel_str}{row.get('title', gid)} "
                   f"({row.get('author','')}){year_str} — {row.get('system','')}{rating_str}")
         print()
 
@@ -326,7 +326,7 @@ def show_results(
     candidates ever reached the reranker.
     """
     results = select_results(
-        scored, hard_filters, game_info_map, top_k,
+        order_by_relevance(scored, relevance or {}), hard_filters, game_info_map, top_k,
         use_diversity=use_diversity,
         target_genres=target_genres, target_systems=target_systems,
     )
