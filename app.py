@@ -59,7 +59,11 @@ MODES = ["game", "author", "reviewer", "vibe"]
 # anyone who wants to weigh it themselves.
 RESULT_COLUMNS = ["#", "relevance", "rating", "title",
                   "author", "year", "system", "genre", "tags"]
-PAGE_SIZES = [10, 25, 50]
+# Even sizes only, and no 25. Results are two-up above 1024px, so an odd page
+# size leaves a lone card in the last row with an empty slot beside it — which
+# reads as "that is all there is" even when more pages follow.
+PAGE_SIZES = [10, 20, 50]
+DEFAULT_PAGE_SIZE = 20
 SCROLL_TO_SUMMARY = ("() => { const el = document.getElementById('summary');"
                      " if (el) el.scrollIntoView({behavior: 'smooth', block: 'start'}); }")
 ANY_LABEL = "any"
@@ -96,10 +100,6 @@ FOOTER_HTML = (
     f'source on GitHub</a>'
 )
 
-# Longest values a cell may show before trailing off. Tags and multi-author
-# credits are unbounded in the source data and will otherwise blow up row height.
-CLIP = {"author": 34, "tags": 170, "genre": 46, "system": 26}
-
 # NOTE: keep this free of /* */ comments — Gradio drops the remainder of the
 # sheet when it encounters one, silently discarding later rules.
 #
@@ -114,14 +114,34 @@ CLIP = {"author": 34, "tags": 170, "genre": 46, "system": 26}
 # to spare.
 #
 # Width buys *columns of cards* rather than narrower cells: one up to 1024px,
-# two to 1600px, three above. The grid lives on `tbody`, so ordering is the
-# browser's default row-major flow — result 1 top-left, result 2 to its right —
-# and rank stays readable left-to-right the way a numbered list should.
+# two above. The grid lives on `tbody`, so ordering is the browser's default
+# row-major flow — result 1 top-left, result 2 to its right — and rank stays
+# readable left-to-right the way a numbered list should.
 #
-# `align-items: start` keeps a short card from stretching to match a tall
-# neighbour. Rows still take the height of their tallest card, which is what
-# grid does; the alternative is a masonry layout whose reading order is column-
-# major, and that would break the numbering.
+# Two columns is the ceiling because the page itself is capped at 1280px. A
+# third column would not widen anything: it would spend that same 1280px on
+# narrower cards (596px → 387px, about phone width), so maximising the window
+# would make each result *smaller*. The cap and the column count have to be
+# decided together — raise `max-width` and a third column becomes worth it
+# again.
+#
+# Card height is bounded by clamping fields rather than by fixing a height:
+# every value is one line with an ellipsis, except tags, which get five. The
+# clamping is CSS (`text-overflow` and `-webkit-line-clamp`) rather than
+# truncating the string in Python, because a card is 366px on a phone and 596px
+# on a desktop — a character budget that fits one is wrong for the other, and
+# would trail off mid-line while empty space sat to the right.
+#
+# That needs each value wrapped in a `span.v`: the value would otherwise be a
+# bare text node, which is an anonymous grid item and cannot take overflow or a
+# line clamp.
+#
+# Cards are then a fixed height rather than merely bounded: the tags value
+# reserves its full five lines (`height: 7.5em`, five times the 1.5 line-height)
+# whether or not it needs them, and `.v { min-height: 1.5em }` keeps a field
+# with no value occupying its line. Every card therefore has the same fields on
+# the same lines, so scanning across a row compares like with like — which is
+# worth more than the blank space it costs on sparse games.
 #
 # The remaining @media block is 768px, and it is about touch rather than
 # results: bigger tap targets, 16px inputs, filters two-up, tighter padding.
@@ -131,8 +151,8 @@ CLIP = {"author": 34, "tags": 170, "genre": 46, "system": 26}
 # Details that are load-bearing:
 #   * the 1fr track is minmax(0, 1fr) — a bare 1fr floors at max-content, so a
 #     long tag list overflows the card instead of wrapping inside it
-#   * td:empty is hidden, or a field the game lacks renders as a label with
-#     nothing beside it, which reads as missing data rather than absent
+#   * every field is emitted even when empty, and reserves its line, because
+#     alignment across a row depends on it
 #   * 16px inputs, below which iOS Safari zooms on focus and stays zoomed
 #   * `order` pulls rank and title ahead of the relevance and rating fields
 #     that precede them in the DOM, so the card leads with what identifies
@@ -146,9 +166,17 @@ CLIP = {"author": 34, "tags": 170, "genre": 46, "system": 26}
 #
 # min-width:0 on their descendants because Gradio's own component CSS carries
 # min-widths up to 200px; two of those in one row exceed a 360px phone.
+#
+# Do not put a `gap` on that form when the filters wrap. A Gradio group paints
+# the divider colour as its own background and lets opaque children sit on top,
+# so the hairlines between filters are really 1px of group background showing
+# through. Widening the gap widens those lines: a 0.5em gap rendered as 7px
+# bands between the filter cells at 560px, which read as a rendering fault.
+# Gradio's own 1px gap is the hairline — leave it alone and size the children
+# to `calc(50% - 0.5px)` so two of them plus the gap come to exactly 100%.
 CSS = """
 :root, .gradio-container { font-family: "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace !important; }
-.gradio-container { max-width: 100% !important;
+.gradio-container { max-width: 1280px !important; margin: 0 auto !important;
   padding: 1.2em clamp(0.25rem, 1.5vw, 1.6em) !important; box-sizing: border-box !important;
   --block-radius: 10px; --block-border-width: 1px;
   --block-border-color: rgba(128,128,128,0.16);
@@ -159,14 +187,19 @@ CSS = """
   --button-large-radius: 8px; --button-small-radius: 6px;
   --button-primary-shadow: none; --button-secondary-shadow: none; }
 .gradio-container .app { padding-left: clamp(0.25rem, 1.5vw, var(--size-8)) !important;
-  padding-right: clamp(0.25rem, 1.5vw, var(--size-8)) !important; }
+  padding-right: clamp(0.25rem, 1.5vw, var(--size-8)) !important;
+  max-width: 100% !important; }
 h1 { font-weight: 600 !important; letter-spacing: -0.01em; margin-bottom: 0.15em !important; }
 #tagline { margin: 0 0 1.1em !important; }
 #tagline p { margin: 0 !important; font-size: 1em !important; letter-spacing: 0.01em;
   color: var(--body-text-color-subdued) !important; }
-#results .results-table { width: 100%; display: block; font-size: 1em; margin-top: 0.6em; }
+#results { border: none !important; background: none !important; box-shadow: none !important;
+  padding: 0 !important; }
+#results .html-container { padding: 0 !important; }
+#results .results-table { width: 100%; display: block; font-size: 1em; margin-top: 0.6em;
+  border: none !important; }
 #results .results-table td { text-indent: 0 !important; }
-#results .results-table tbody { display: grid; gap: 0.75em; align-items: start;
+#results .results-table tbody { display: grid; gap: 0.75em; align-items: stretch;
   grid-template-columns: minmax(0, 1fr); }
 #results .results-table tr { display: flex; flex-wrap: wrap; align-items: baseline;
   border: 1px solid rgba(128,128,128,0.18); border-radius: 10px;
@@ -177,19 +210,21 @@ h1 { font-weight: 600 !important; letter-spacing: -0.01em; margin-bottom: 0.15em
   line-height: 1.5; overflow-wrap: break-word; }
 #results .results-table td::before { content: attr(data-label); opacity: 0.45;
   font-size: 0.85em; letter-spacing: 0.04em; }
-#results .results-table td:empty { display: none; }
+#results .results-table td .v { display: block; min-width: 0; min-height: 1.5em;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#results .results-table td[data-label="tags"] .v { white-space: normal;
+  display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 5;
+  line-clamp: 5; height: 7.5em; }
 #results .results-table td[data-label="#"],
 #results .results-table td[data-label="title"] {
   display: block; flex: 0 1 auto; padding-bottom: 0.3em; }
 #results .results-table td[data-label="#"]::before,
 #results .results-table td[data-label="title"]::before { content: none; }
 #results .results-table td[data-label="#"] { order: -2; opacity: 0.4; margin-right: 0.55em; }
-#results .results-table td[data-label="title"] { order: -1; flex: 1 1 auto; font-size: 1.05em; }
+#results .results-table td[data-label="title"] { order: -1; flex: 1 1 auto; font-size: 1.05em;
+  min-width: 0; overflow: hidden; }
 @media (min-width: 1024px) {
   #results .results-table tbody { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0.85em; }
-}
-@media (min-width: 1600px) {
-  #results .results-table tbody { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 }
 #results .results-table a { text-decoration: none; font-weight: 600; display: inline !important;
   text-indent: 0 !important; padding: 0 !important; margin: 0 !important; border: none !important; }
@@ -206,14 +241,15 @@ h1 { font-weight: 600 !important; letter-spacing: -0.01em; margin-bottom: 0.15em
 /* Darker than the block body so a header does not read as an editable field. */
 .block-header { padding: 0.65em 0 0.6em 0.85em !important; margin: 0 !important;
   background: var(--block-background-fill) !important; border: none !important;
-  border-bottom: 1px solid rgba(128,128,128,0.14) !important;
+  border-bottom: 1px solid rgba(128,128,128,0.16) !important;
   border-radius: 10px 10px 0 0 !important; letter-spacing: 0.03em; }
-.block-header p, .block-header span { font-size: 1.05em !important; opacity: 0.62; }
+.block-header p, .block-header span { font-size: 1.05em !important;
+  color: var(--body-text-color) !important; font-weight: 500 !important; }
 #filters-head { background: var(--block-background-fill) !important;
   border-radius: 10px 10px 0 0 !important;
-  border-bottom: 1px solid rgba(128,128,128,0.14) !important; }
-#filters-head .block-header { border-bottom: none !important; border-radius: 0 !important; }
-#filters-head .block-header { background: none !important; border-radius: 0 !important; }
+  border-bottom: 1px solid rgba(128,128,128,0.16) !important; }
+#filters-head .block-header { background: none !important; border-bottom: none !important;
+  border-radius: 0 !important; }
 /* Padding in rem, not em: em would be relative to this element's own font
    size, so changing the text size would silently shift the indent too. */
 /* Page background, not the group's fill, so the line does not read as an input.
@@ -223,6 +259,19 @@ h1 { font-weight: 600 !important; letter-spacing: -0.01em; margin-bottom: 0.15em
 /* Size the text only, never the wrapper too — em on both compounds. */
 .filter-hint p, .filter-hint span { font-size: 0.92em !important; line-height: 1.3 !important;
   opacity: 0.45; }
+#summary:has(p) { position: relative; margin: 2.2em 0 0.2em !important;
+  padding: 0.9em 1.05em !important; border-radius: 10px !important;
+  background: linear-gradient(rgba(128,128,128,0.10), rgba(128,128,128,0.10)),
+    var(--block-background-fill) !important;
+  border: 1px solid rgba(128,128,128,0.14) !important; }
+#summary:has(p)::before { content: ""; position: absolute; left: 0; right: 0; top: -1.15em;
+  border-top: 1px solid rgba(128,128,128,0.18); }
+#summary p { margin: 0.2em 0 !important; }
+#summary code { background: var(--block-background-fill) !important;
+  border: 1px solid rgba(128,128,128,0.18) !important; }
+#result-count { margin: 1.4em 0 0 !important; }
+#result-count p { margin: 0 !important; font-size: 0.92em !important; opacity: 0.6; }
+#pager:not(:has(.md p)) { display: none !important; }
 footer { display: none !important; }
 #page-footer { margin-top: 2.2em !important; padding: 1em 0 0.4em !important;
   border-top: 1px solid rgba(128,128,128,0.14) !important; }
@@ -238,11 +287,10 @@ footer { display: none !important; }
   .control-row, .control-row > * { flex-wrap: wrap !important; }
   .control-row > * {
     display: flex !important; flex: 1 1 100% !important; max-width: 100% !important;
-    gap: 0.5em !important;
   }
   .control-row > * > * {
-    flex: 1 1 calc(50% - 0.35em) !important;
-    max-width: calc(50% - 0.35em) !important;
+    flex: 1 1 calc(50% - 0.5px) !important;
+    max-width: calc(50% - 0.5px) !important;
   }
   #action-row { flex-wrap: wrap !important; }
   #action-row > * { flex: 1 1 100% !important; max-width: 100% !important; }
@@ -357,13 +405,6 @@ def _as_int(value, default):
         return default
 
 
-def _clip(value, limit):
-    text = str(value)
-    if len(text) <= limit:
-        return text
-    return text[: limit - 1].rstrip(" ,") + "…"
-
-
 def _rank(query_text, emb, exclude, cached):
     """Serve a precomputed ranking, or score the pool live."""
     if cached is not None:
@@ -449,12 +490,18 @@ def _table_update(frame):
         cells = []
         for name, value in zip(RESULT_COLUMNS, row):
             # `title` arrives pre-built as a link; everything else is escaped text.
-            text = value if name == "title" else escape(str(value))
-            # data-label carries the column name into each cell so the narrow
-            # layout can label it. A ten-column table cannot stay a table on a
-            # phone, and once the header row is gone every value needs to say
-            # what it is. Costs one attribute per cell and nothing on desktop.
-            cells.append(f'<td data-label="{escape(name, quote=True)}">{text}</td>')
+            # Every field is emitted even when the game has no value for it, so
+            # that the same label sits on the same line in every card. A blank
+            # value beside a label is the price of that alignment; dropping the
+            # row instead would shift every field below it up by a line and put
+            # neighbouring cards out of step.
+            inner = value if name == "title" else escape(str(value))
+            # data-label carries the column name into each cell so the card
+            # layout can label it, and the value is wrapped so CSS can clamp it:
+            # a bare text node in a grid cell is an anonymous item and cannot be
+            # given overflow or a line clamp.
+            cells.append(f'<td data-label="{escape(name, quote=True)}">'
+                         f'<span class="v">{inner}</span></td>')
         body.append("<tr>" + "".join(cells) + "</tr>")
     return f'<table class="results-table"><tbody>{"".join(body)}</tbody></table>'
 
@@ -471,11 +518,11 @@ def _page_table(results, relevance, page, per_page):
             pipeline._rating_cell(row),
             (f'<a href="{IFDB_GAME_URL.format(gameid=gid)}" target="_blank" '
              f'rel="noopener">{escape(str(row.get("title", gid)))}</a>'),
-            _clip(row.get("author", ""), CLIP["author"]),
+            str(row.get("author", "")),
             str(row.get("year", "")),
-            _clip(row.get("system_display", row.get("system", "")), CLIP["system"]),
-            _clip(row.get("genre_display", row.get("genre", "")), CLIP["genre"]),
-            _clip(row.get("tags_display", row.get("tags", "")), CLIP["tags"]),
+            str(row.get("system_display", row.get("system", ""))),
+            str(row.get("genre_display", row.get("genre", ""))),
+            str(row.get("tags_display", row.get("tags", ""))),
         ])
     return pd.DataFrame(rows, columns=RESULT_COLUMNS)
 
@@ -486,27 +533,41 @@ def _profile_display(query_text, corpus_order=False):
     return profile_display(query_text, *freq)
 
 
-def _summary(headline, query_text, n_results, page, per_page, corpus_order=False):
+def _summary(headline, query_text, corpus_order=False):
     """
-    The line above the results: what was asked for, the profile it resolved to,
-    and how much came back.
+    What was asked for and the profile it resolved to.
 
     The profile is shown for every mode, not just `vibe`, because it is the
     actual query in all of them. Phrasing it as "games like X: <profile>" keeps
     it reading as a description of what is being looked for rather than a set of
     constraints the results all satisfy.
+
+    The count of results lives in `_result_count`, not here: this describes the
+    *query*, and sits in its own panel above the divider, while the count
+    belongs to the *results* and sits directly on top of them.
     """
+    profile = _profile_display(query_text, corpus_order)
+    return f"{headline}: `{profile}`" if profile else headline
+
+
+def _result_count(n_results, page, per_page):
+    """The tally that sits immediately above the cards it is counting."""
+    if not n_results:
+        return ""
     first = page * per_page + 1
     last = min(n_results, (page + 1) * per_page)
-    profile = _profile_display(query_text, corpus_order)
-    line = f"{headline}: `{profile}`" if profile else headline
-    return f"{line}\n\n**{n_results} results** · showing {first}–{last}"
+    return f"**{n_results} results** · showing {first}–{last}"
+
+
+def _count_for(state):
+    """Rebuild the count from state, so paging updates the shown range."""
+    return _result_count(len(state["results"]), state["page"],
+                         _as_int(state["per_page"], DEFAULT_PAGE_SIZE))
 
 
 def _summary_for(state):
-    """Rebuild the summary from state, so paging updates the shown range."""
+    """Rebuild the summary from state."""
     return _summary(state.get("headline", ""), state.get("query_text", ""),
-                    len(state["results"]), state["page"], _as_int(state["per_page"], 25),
                     state.get("corpus_order", False))
 
 
@@ -551,14 +612,14 @@ def recommend(state, mode, game, author, user, systems, tags,
     blank = pd.DataFrame(columns=RESULT_COLUMNS)
     empty_state = {"results": [], "scored": [], "relevance": {},
                    "query_key": None, "page": 0, "per_page": per_page}
-    per_page = _as_int(per_page, 25)
+    per_page = _as_int(per_page, DEFAULT_PAGE_SIZE)
     hard_filters = _build_filters(f_genre, f_system, f_author, f_tags,
                                   f_rating, f_count, f_year_from, f_year_to)
     exclude, cached, emb, query_text = set(), None, None, ""
 
     if mode == "game":
         if not game:
-            return _table_update(blank), "Pick a game to get recommendations like it.", empty_state, ""
+            return _table_update(blank), "Pick a game to get recommendations like it.", "", empty_state, ""
         query_text = GAME_QUERY_TEXT_MAP.get(game, DOC_MAP.get(game, ""))
         cached, exclude = PRE_GAME.get(game), {game}
         emb = None if cached is not None else RETRIEVER._encode_game_ids([game])
@@ -566,16 +627,16 @@ def recommend(state, mode, game, author, user, systems, tags,
 
     elif mode == "author":
         if not author:
-            return _table_update(blank), "Pick an author.", empty_state, ""
+            return _table_update(blank), "Pick an author.", "", empty_state, ""
         query_text = AUTHOR_PROFILE_MAP.get(author, "")
         cached = PRE_AUTHOR.get(author)
         exclude = set(AUTHOR_GAMES.get(author, []))
         emb = None if cached is not None else QUERY_ENCODER.encode([query_text], normalize_embeddings=True)[0]
-        note = f"in the spirit of **{AUTHOR_NAME_MAP.get(author, author)}** (their own games excluded)"
+        note = f"in the spirit of **{AUTHOR_NAME_MAP.get(author, author)}** (excluding their own games)"
 
     elif mode == "reviewer":
         if not user:
-            return _table_update(blank), "Pick a reviewer.", empty_state, ""
+            return _table_update(blank), "Pick a reviewer.", "", empty_state, ""
         query_text = PROFILE_MAP.get(user, "")
         cached = PRE_USER.get(user)
         if REVIEWS_DF is not None:
@@ -583,17 +644,17 @@ def recommend(state, mode, game, author, user, systems, tags,
         if PLAYEDGAMES_DF is not None:
             exclude |= set(PLAYEDGAMES_DF[PLAYEDGAMES_DF["userid"] == user]["gameid"])
         emb = None if cached is not None else RETRIEVER._encode_userid(user)
-        note = f"for **{USER_NAME_MAP.get(user, user)}** (games they've rated or played excluded)"
+        note = f"for **{USER_NAME_MAP.get(user, user)}** (excluding games they've rated or played)"
 
     else:  # vibe
         if not systems and not tags:
-            return _table_update(blank), "Pick at least one system or tag.", empty_state, ""
+            return _table_update(blank), "Pick at least one system or tag.", "", empty_state, ""
         query_text = format_profile_text(list(systems or []), list(tags or []))
         emb = QUERY_ENCODER.encode([query_text], normalize_embeddings=True)[0]
         note = "games matching this vibe"
 
     if not query_text:
-        return _table_update(blank), "No profile available for that selection.", empty_state, ""
+        return _table_update(blank), "No profile available for that selection.", "", empty_state, ""
 
     # Scoring is the expensive half and depends only on the query, never on the
     # filters. Reuse it while the user narrows results, and drop it as soon as
@@ -610,7 +671,7 @@ def recommend(state, mode, game, author, user, systems, tags,
     else:
         scored, relevance = _rank(query_text, emb, exclude, cached)
     if not scored:
-        return _table_update(blank), "Nothing above the retrieval threshold for that query.", empty_state, ""
+        return _table_update(blank), "Nothing above the retrieval threshold for that query.", "", empty_state, ""
 
     targets = pipeline._parse_profile_targets(query_text) if mode != "vibe" else (set(), set())
     # Ask for every result the pool can yield, then paginate locally.
@@ -620,34 +681,36 @@ def recommend(state, mode, game, author, user, systems, tags,
         target_genres=targets[0], target_systems=targets[1],
     )
     if not results:
-        return _table_update(blank), f"{note}\n\nNo results match those filters — try relaxing them.", empty_state, ""
+        return _table_update(blank), f"{note}\n\nNo results match those filters — try relaxing them.", "", empty_state, ""
 
     state = {"results": results, "scored": scored, "relevance": relevance,
              "query_key": query_key, "page": 0, "per_page": per_page,
              "headline": note, "query_text": query_text,
              "corpus_order": mode in ("game", "vibe")}
-    summary = _summary(note, query_text, len(results), 0, per_page,
-                       corpus_order=mode in ("game", "vibe"))
-    return _table_update(_page_table(results, relevance, 0, per_page)), summary, state, _pager_text(state)
+    summary = _summary(note, query_text, corpus_order=mode in ("game", "vibe"))
+    return (_table_update(_page_table(results, relevance, 0, per_page)), summary,
+            _result_count(len(results), 0, per_page), state, _pager_text(state))
 
 
 def turn_page(state, step):
     if not state or not state["results"]:
-        return _table_update(pd.DataFrame(columns=RESULT_COLUMNS)), "", state, ""
-    per_page = _as_int(state["per_page"], 25)
+        return _table_update(pd.DataFrame(columns=RESULT_COLUMNS)), "", "", state, ""
+    per_page = _as_int(state["per_page"], DEFAULT_PAGE_SIZE)
     pages = max(1, -(-len(state["results"]) // per_page))
     state = {**state, "per_page": per_page, "page": min(max(state["page"] + step, 0), pages - 1)}
     table = _page_table(state["results"], state["relevance"], state["page"], per_page)
-    return _table_update(table), _summary_for(state), state, _pager_text(state)
+    return (_table_update(table), _summary_for(state), _count_for(state), state,
+            _pager_text(state))
 
 
 def resize_page(state, per_page):
-    per_page = _as_int(per_page, 25)
+    per_page = _as_int(per_page, DEFAULT_PAGE_SIZE)
     if not state or not state["results"]:
-        return _table_update(pd.DataFrame(columns=RESULT_COLUMNS)), "", {**(state or {}), "per_page": per_page}, ""
+        return _table_update(pd.DataFrame(columns=RESULT_COLUMNS)), "", "", {**(state or {}), "per_page": per_page}, ""
     state = {**state, "per_page": per_page, "page": 0}
     table = _page_table(state["results"], state["relevance"], 0, per_page)
-    return _table_update(table), _summary_for(state), state, _pager_text(state)
+    return (_table_update(table), _summary_for(state), _count_for(state), state,
+            _pager_text(state))
 
 
 def _visibility(mode):
@@ -659,7 +722,7 @@ def build_ui():
         gr.Markdown("# IFDB recs")
         gr.Markdown(TAGLINE, elem_id="tagline")
         state = gr.State({"results": [], "scored": [], "relevance": {},
-                          "query_key": None, "page": 0, "per_page": 25})
+                          "query_key": None, "page": 0, "per_page": DEFAULT_PAGE_SIZE})
 
         with gr.Group():
             gr.Markdown("search mode", elem_classes="block-header")
@@ -711,10 +774,11 @@ def build_ui():
                 f_year_to = gr.Dropdown(YEAR_CHOICES, value=FILTER_DEFAULTS[7], label="year ≤")
 
         with gr.Row(elem_id="action-row"):
-            per_page = gr.Dropdown(PAGE_SIZES, value=25, label="results per page", scale=1)
+            per_page = gr.Dropdown(PAGE_SIZES, value=DEFAULT_PAGE_SIZE, label="results per page", scale=1)
             go = gr.Button("recommend", variant="primary", scale=3)
 
         note = gr.Markdown(elem_id="summary")
+        count = gr.Markdown(elem_id="result-count")
         table = gr.HTML(
             elem_id="results",
         )
@@ -739,14 +803,14 @@ def build_ui():
                   f_year_from, f_year_to, per_page]
         # One at a time: two CPUs shared between concurrent requests makes
         # everyone slow, whereas a queue makes the wait visible.
-        go.click(recommend, inputs, [table, note, state, pager], concurrency_limit=1)
+        go.click(recommend, inputs, [table, note, count, state, pager], concurrency_limit=1)
         # Paging lands the reader back at the summary, not stranded at the
         # bottom of the previous page.
-        prev.click(lambda s: turn_page(s, -1), state, [table, note, state, pager]).then(
+        prev.click(lambda s: turn_page(s, -1), state, [table, note, count, state, pager]).then(
             None, None, None, js=SCROLL_TO_SUMMARY)
-        nxt.click(lambda s: turn_page(s, +1), state, [table, note, state, pager]).then(
+        nxt.click(lambda s: turn_page(s, +1), state, [table, note, count, state, pager]).then(
             None, None, None, js=SCROLL_TO_SUMMARY)
-        per_page.change(resize_page, [state, per_page], [table, note, state, pager])
+        per_page.change(resize_page, [state, per_page], [table, note, count, state, pager])
     return demo
 
 
