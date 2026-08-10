@@ -148,7 +148,8 @@ CLIP = {"author": 34, "tags": 170, "genre": 46, "system": 26}
 # min-widths up to 200px; two of those in one row exceed a 360px phone.
 CSS = """
 :root, .gradio-container { font-family: "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace !important; }
-.gradio-container { max-width: 100% !important; padding: 1.2em 1.6em !important;
+.gradio-container { max-width: 100% !important;
+  padding: 1.2em clamp(0.25rem, 1.5vw, 1.6em) !important; box-sizing: border-box !important;
   --block-radius: 10px; --block-border-width: 1px;
   --block-border-color: rgba(128,128,128,0.16);
   --block-shadow: none; --block-label-shadow: none;
@@ -157,6 +158,8 @@ CSS = """
   --input-radius: 8px; --input-border-color: rgba(128,128,128,0.22);
   --button-large-radius: 8px; --button-small-radius: 6px;
   --button-primary-shadow: none; --button-secondary-shadow: none; }
+.gradio-container .app { padding-left: clamp(0.25rem, 1.5vw, var(--size-8)) !important;
+  padding-right: clamp(0.25rem, 1.5vw, var(--size-8)) !important; }
 h1 { font-weight: 600 !important; letter-spacing: -0.01em; margin-bottom: 0.15em !important; }
 #tagline { margin: 0 0 1.1em !important; }
 #tagline p { margin: 0 !important; font-size: 1em !important; letter-spacing: 0.01em;
@@ -230,7 +233,6 @@ footer { display: none !important; }
 #page-footer a:hover { color: var(--body-text-color) !important; }
 
 @media (max-width: 768px) {
-  .gradio-container { box-sizing: border-box !important; padding: 0.8em 0.7em !important; }
   input, textarea, select { font-size: 16px !important; }
   .control-row *, #action-row * { min-width: 0 !important; }
   .control-row, .control-row > * { flex-wrap: wrap !important; }
