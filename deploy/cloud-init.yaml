@@ -6,6 +6,12 @@
 # creating the instance, or pass with:
 #     oci compute instance launch --user-data-file deploy/cloud-init.yaml ...
 #
+# Take this file from the repo each time — never a copy. The OCI console
+# pre-fills the previous instance's script, and Cloud Shell's home persists
+# between sessions, so an old upload sits there under the right name. From
+# Cloud Shell, curl it from raw.githubusercontent rather than uploading.
+# See "Verify the boot" in deploy/README.md for the check that catches a stale one.
+#
 # Works on Ubuntu 24.04, x86_64 or Ampere A1 (aarch64). Nothing here depends on
 # the distro's Python: uv downloads its own CPython 3.14, so 24.04 shipping 3.12
 # is irrelevant and the system interpreter is left alone for system tools.
