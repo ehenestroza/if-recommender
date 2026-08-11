@@ -1,6 +1,6 @@
 #cloud-config
 #
-# OCI cloud-init for the IFDB recs web app.
+# OCI cloud-init for the IF recommender web app.
 #
 # Paste into "Show advanced options → Management → Cloud-init script" when
 # creating the instance, or pass with:
@@ -35,7 +35,7 @@ write_files:
       # Public hostname. Drives nginx's server_name and is the -d argument to
       # certbot. Leave empty to serve on the bare IP as a catch-all, which is
       # what you want before DNS exists — certbot cannot issue for an IP.
-      DOMAIN=ifdb-recs.datalexic.com
+      DOMAIN=if-recommender.datalexic.com
 
   # ---------------------------------------------------------------------------
   # Runtime environment for the service. The thread caps are appended by runcmd
@@ -63,7 +63,7 @@ write_files:
     permissions: "0644"
     content: |
       [Unit]
-      Description=IFDB recs web app
+      Description=IF recommender web app
       After=network-online.target
       Wants=network-online.target
 
@@ -195,7 +195,7 @@ runcmd:
   - ln -sf /snap/bin/certbot /usr/local/bin/certbot
 
 final_message: |
-  IFDB recs deployed after $UPTIME seconds.
+  IF recommender deployed after $UPTIME seconds.
 
   Two manual steps remain — see deploy/README.md:
 

@@ -779,8 +779,8 @@ def _visibility(mode):
 
 
 def build_ui():
-    with gr.Blocks(title="interactive fiction recs") as demo:
-        gr.Markdown("# interactive fiction recs")
+    with gr.Blocks(title="IF recommender") as demo:
+        gr.Markdown("# IF recommender")
         state = gr.State({"results": [], "scored": [], "relevance": {},
                           "query_key": None, "page": 0, "per_page": DEFAULT_PAGE_SIZE})
 

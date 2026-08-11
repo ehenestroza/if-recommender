@@ -636,7 +636,7 @@ def run_interactive(
         game_query_text_map = doc_map
 
     print("\n" + "=" * 60)
-    print("  IFDB recs")
+    print("  IF recommender")
     print("=" * 60)
     print(f"  score threshold  : {min_score}   output: {top_k_rank}")
     print("  pick something to search from, then refine the results with filters.")

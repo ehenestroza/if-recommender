@@ -1,4 +1,4 @@
-# interactive fiction recs
+# IF recommender
 
 Game recommendations for interactive fiction, built on the [Interactive Fiction Database](https://ifdb.org).
 
