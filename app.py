@@ -14,6 +14,7 @@ Run locally with `python app.py`; Hugging Face Spaces picks this file up by name
 
 import importlib.util
 import logging
+from datetime import date
 from functools import lru_cache
 from pathlib import Path
 
@@ -90,14 +91,44 @@ FREE_TEXT_HINT = "type text fragments and press return · case insensitive"
 RATING_CHOICES = [round(0.5 * i, 1) for i in range(10)]      # 0.0 … 4.5
 RATING_COUNT_CHOICES = [0, 1, 2, 5, 10, 25, 50]
 
-TAGLINE = "find your next interactive fiction game"
-
 REPO_URL = "https://github.com/ehenestroza/if-recommender"
-# Rendered with sanitize_html=False so target/rel survive. Safe because this is
-# a literal constant — nothing user-supplied reaches it.
+LICENSE_URL = f"{REPO_URL}/blob/main/LICENSE"
+IFDB_URL = "https://ifdb.org"
+IFARCHIVE_URL = "https://ifarchive.org/indexes/if-archive/info/ifdb/"
+DATA_LICENSE_URL = "https://creativecommons.org/licenses/by/3.0/us/"
+
+# The IFDB dump this was built from. IFDB publishes to the IF Archive roughly
+# quarterly, so refreshing the data means re-running the pipeline and moving
+# this date. Kept as an ISO string and formatted for display, so updating it is
+# one unambiguous edit and no reader has to guess whether 6/1 is June or
+# January. `data/manifest.json` deliberately carries no timestamp — it records
+# what the data *is*, not when it was taken — so this cannot be derived.
+DATA_THROUGH = "2026-06-01"
+
+
+def _link(href: str, text: str) -> str:
+    return f'<a href="{href}" target="_blank" rel="noopener">{text}</a>'
+
+
+def _data_through(iso: str) -> str:
+    """ISO date to "1 June 2026". Day is unpadded; %-d is not portable."""
+    day = date.fromisoformat(iso)
+    return f"{day.day} {day.strftime('%B')} {day.year}"
+
+
+# Two lines: who made it, and where the data came from. The second is not
+# decoration — IFDB content is CC BY 3.0 US, which permits these extracts and
+# the models trained on them precisely on condition that IFDB is credited, so
+# the attribution belongs somewhere a reader actually sees it rather than only
+# in the repository. Rendered with sanitize_html=False so target/rel survive;
+# safe because every part is a literal constant.
 FOOTER_HTML = (
-    f'by Enrique · <a href="{REPO_URL}" target="_blank" rel="noopener">'
-    f'source on GitHub</a>'
+    f'by Enrique · {_link(REPO_URL, "source on GitHub")}'
+    f' · {_link(LICENSE_URL, "MIT licence")}<br>'
+    f'game data from {_link(IFDB_URL, "IFDB")}'
+    f', via the {_link(IFARCHIVE_URL, "IF Archive")}'
+    f' · through {_data_through(DATA_THROUGH)}'
+    f' · used under {_link(DATA_LICENSE_URL, "CC BY 3.0 US")}'
 )
 
 # NOTE: keep this free of /* */ comments — Gradio drops the remainder of the
@@ -185,14 +216,13 @@ CSS = """
   --border-color-secondary: rgba(128,128,128,0.07);
   --input-radius: 8px; --input-border-color: rgba(128,128,128,0.22);
   --button-large-radius: 8px; --button-small-radius: 6px;
-  --button-primary-shadow: none; --button-secondary-shadow: none; }
+  --button-primary-shadow: none; --button-secondary-shadow: none;
+  --app-link: #2563eb; --app-link-visited: #7c3aed; }
+.dark .gradio-container { --app-link: #7aa7ff; --app-link-visited: #cba6ff; }
 .gradio-container .app { padding-left: clamp(0.25rem, 1.5vw, var(--size-8)) !important;
   padding-right: clamp(0.25rem, 1.5vw, var(--size-8)) !important;
   max-width: 100% !important; }
-h1 { font-weight: 600 !important; letter-spacing: -0.01em; margin-bottom: 0.15em !important; }
-#tagline { margin: 0 0 1.1em !important; }
-#tagline p { margin: 0 !important; font-size: 1em !important; letter-spacing: 0.01em;
-  color: var(--body-text-color-subdued) !important; }
+h1 { font-weight: 600 !important; letter-spacing: -0.01em; margin-bottom: 0.6em !important; }
 #results { border: none !important; background: none !important; box-shadow: none !important;
   padding: 0 !important; }
 #results .html-container { padding: 0 !important; }
@@ -220,14 +250,17 @@ h1 { font-weight: 600 !important; letter-spacing: -0.01em; margin-bottom: 0.15em
   display: block; flex: 0 1 auto; padding-bottom: 0.3em; }
 #results .results-table td[data-label="#"]::before,
 #results .results-table td[data-label="title"]::before { content: none; }
-#results .results-table td[data-label="#"] { order: -2; opacity: 0.4; margin-right: 0.55em; }
+#results .results-table td[data-label="#"] { order: -2; margin-right: 0.55em;
+  font-weight: 700 !important; color: var(--body-text-color) !important; }
 #results .results-table td[data-label="title"] { order: -1; flex: 1 1 auto; font-size: 1.05em;
   min-width: 0; overflow: hidden; }
 @media (min-width: 1024px) {
   #results .results-table tbody { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0.85em; }
 }
 #results .results-table a { text-decoration: none; font-weight: 600; display: inline !important;
-  text-indent: 0 !important; padding: 0 !important; margin: 0 !important; border: none !important; }
+  text-indent: 0 !important; padding: 0 !important; margin: 0 !important; border: none !important;
+  color: var(--app-link) !important; }
+#results .results-table a:visited { color: var(--app-link-visited) !important; }
 #results .results-table a::before, #results .results-table a::after { content: none !important; display: none !important; }
 #results .results-table a:hover { text-decoration: underline; }
 #pager { align-items: center; }
@@ -245,6 +278,8 @@ h1 { font-weight: 600 !important; letter-spacing: -0.01em; margin-bottom: 0.15em
   border-radius: 10px 10px 0 0 !important; letter-spacing: 0.03em; }
 .block-header p, .block-header span { font-size: 1.05em !important;
   color: var(--body-text-color) !important; font-weight: 500 !important; }
+.block-header .block-header { border-bottom: none !important; padding: 0 !important;
+  background: none !important; }
 #filters-head { background: var(--block-background-fill) !important;
   border-radius: 10px 10px 0 0 !important;
   border-bottom: 1px solid rgba(128,128,128,0.16) !important; }
@@ -254,11 +289,12 @@ h1 { font-weight: 600 !important; letter-spacing: -0.01em; margin-bottom: 0.15em
    size, so changing the text size would silently shift the indent too. */
 /* Page background, not the group's fill, so the line does not read as an input.
    Uses the theme variable so it stays correct in dark mode too. */
-.filter-hint { padding: 0.55em 0 0.6em 0.85rem !important; margin: 0 !important;
+.filter-hint { padding: 0.55em 0 0.6em 1rem !important; margin: 0 !important;
   background: var(--block-background-fill) !important; }
+.filter-hint .filter-hint { padding: 0 !important; background: none !important; }
 /* Size the text only, never the wrapper too — em on both compounds. */
 .filter-hint p, .filter-hint span { font-size: 0.92em !important; line-height: 1.3 !important;
-  opacity: 0.45; }
+  color: var(--block-info-text-color) !important; }
 #summary:has(p) { position: relative; margin: 2.2em 0 0.2em !important;
   padding: 0.9em 1.05em !important; border-radius: 10px !important;
   background: linear-gradient(rgba(128,128,128,0.10), rgba(128,128,128,0.10)),
@@ -275,11 +311,12 @@ h1 { font-weight: 600 !important; letter-spacing: -0.01em; margin-bottom: 0.15em
 footer { display: none !important; }
 #page-footer { margin-top: 2.2em !important; padding: 1em 0 0.4em !important;
   border-top: 1px solid rgba(128,128,128,0.14) !important; }
-#page-footer p { margin: 0 !important; font-size: 0.9em !important;
+#page-footer p { margin: 0 !important; font-size: 0.9em !important; line-height: 1.7 !important;
   letter-spacing: 0.02em; color: var(--body-text-color-subdued) !important; }
-#page-footer a { color: inherit !important; text-decoration: underline;
+#page-footer a { color: var(--app-link) !important; text-decoration: underline;
   text-underline-offset: 3px; }
-#page-footer a:hover { color: var(--body-text-color) !important; }
+#page-footer a:visited { color: var(--app-link-visited) !important; }
+#page-footer a:hover { text-decoration-thickness: 2px; }
 
 @media (max-width: 768px) {
   input, textarea, select { font-size: 16px !important; }
@@ -579,6 +616,27 @@ def _pager_text(state):
     return f"page {state['page'] + 1} of {pages}  ·  {total} results"
 
 
+def _pager_buttons(state):
+    """
+    Enable prev/next only where there is somewhere to go.
+
+    Without this a click at either end still fires the handler, which re-renders
+    the same page and runs the scroll-to-summary that follows it — so the button
+    looks like it did something, and what it did was jump you to the top of the
+    page you were already on.
+    """
+    total = len(state["results"]) if state else 0
+    if not total:
+        return gr.update(interactive=False), gr.update(interactive=False)
+    per_page = _as_int(state["per_page"], DEFAULT_PAGE_SIZE)
+    last = max(1, -(-total // per_page)) - 1
+    page = state["page"]
+    return gr.update(interactive=page > 0), gr.update(interactive=page < last)
+
+
+NO_PAGES = (gr.update(interactive=False), gr.update(interactive=False))
+
+
 def _build_filters(genre, system, author, tags, rating, count, year_from, year_to):
     """Turn the filter dropdowns into apply_hard_filters kwargs."""
     filters = {}
@@ -619,7 +677,7 @@ def recommend(state, mode, game, author, user, systems, tags,
 
     if mode == "game":
         if not game:
-            return _table_update(blank), "Pick a game to get recommendations like it.", "", empty_state, ""
+            return _table_update(blank), "Pick a game to get recommendations like it.", "", empty_state, "", *NO_PAGES
         query_text = GAME_QUERY_TEXT_MAP.get(game, DOC_MAP.get(game, ""))
         cached, exclude = PRE_GAME.get(game), {game}
         emb = None if cached is not None else RETRIEVER._encode_game_ids([game])
@@ -627,7 +685,7 @@ def recommend(state, mode, game, author, user, systems, tags,
 
     elif mode == "author":
         if not author:
-            return _table_update(blank), "Pick an author.", "", empty_state, ""
+            return _table_update(blank), "Pick an author.", "", empty_state, "", *NO_PAGES
         query_text = AUTHOR_PROFILE_MAP.get(author, "")
         cached = PRE_AUTHOR.get(author)
         exclude = set(AUTHOR_GAMES.get(author, []))
@@ -636,7 +694,7 @@ def recommend(state, mode, game, author, user, systems, tags,
 
     elif mode == "reviewer":
         if not user:
-            return _table_update(blank), "Pick a reviewer.", "", empty_state, ""
+            return _table_update(blank), "Pick a reviewer.", "", empty_state, "", *NO_PAGES
         query_text = PROFILE_MAP.get(user, "")
         cached = PRE_USER.get(user)
         if REVIEWS_DF is not None:
@@ -648,13 +706,13 @@ def recommend(state, mode, game, author, user, systems, tags,
 
     else:  # vibe
         if not systems and not tags:
-            return _table_update(blank), "Pick at least one system or tag.", "", empty_state, ""
+            return _table_update(blank), "Pick at least one system or tag.", "", empty_state, "", *NO_PAGES
         query_text = format_profile_text(list(systems or []), list(tags or []))
         emb = QUERY_ENCODER.encode([query_text], normalize_embeddings=True)[0]
         note = "games matching this vibe"
 
     if not query_text:
-        return _table_update(blank), "No profile available for that selection.", "", empty_state, ""
+        return _table_update(blank), "No profile available for that selection.", "", empty_state, "", *NO_PAGES
 
     # Scoring is the expensive half and depends only on the query, never on the
     # filters. Reuse it while the user narrows results, and drop it as soon as
@@ -671,7 +729,7 @@ def recommend(state, mode, game, author, user, systems, tags,
     else:
         scored, relevance = _rank(query_text, emb, exclude, cached)
     if not scored:
-        return _table_update(blank), "Nothing above the retrieval threshold for that query.", "", empty_state, ""
+        return _table_update(blank), "Nothing above the retrieval threshold for that query.", "", empty_state, "", *NO_PAGES
 
     targets = pipeline._parse_profile_targets(query_text) if mode != "vibe" else (set(), set())
     # Ask for every result the pool can yield, then paginate locally.
@@ -681,7 +739,7 @@ def recommend(state, mode, game, author, user, systems, tags,
         target_genres=targets[0], target_systems=targets[1],
     )
     if not results:
-        return _table_update(blank), f"{note}\n\nNo results match those filters — try relaxing them.", "", empty_state, ""
+        return _table_update(blank), f"{note}\n\nNo results match those filters — try relaxing them.", "", empty_state, "", *NO_PAGES
 
     state = {"results": results, "scored": scored, "relevance": relevance,
              "query_key": query_key, "page": 0, "per_page": per_page,
@@ -689,28 +747,31 @@ def recommend(state, mode, game, author, user, systems, tags,
              "corpus_order": mode in ("game", "vibe")}
     summary = _summary(note, query_text, corpus_order=mode in ("game", "vibe"))
     return (_table_update(_page_table(results, relevance, 0, per_page)), summary,
-            _result_count(len(results), 0, per_page), state, _pager_text(state))
+            _result_count(len(results), 0, per_page), state, _pager_text(state),
+            *_pager_buttons(state))
 
 
 def turn_page(state, step):
     if not state or not state["results"]:
-        return _table_update(pd.DataFrame(columns=RESULT_COLUMNS)), "", "", state, ""
+        return (_table_update(pd.DataFrame(columns=RESULT_COLUMNS)), "", "", state, "",
+            *NO_PAGES)
     per_page = _as_int(state["per_page"], DEFAULT_PAGE_SIZE)
     pages = max(1, -(-len(state["results"]) // per_page))
     state = {**state, "per_page": per_page, "page": min(max(state["page"] + step, 0), pages - 1)}
     table = _page_table(state["results"], state["relevance"], state["page"], per_page)
     return (_table_update(table), _summary_for(state), _count_for(state), state,
-            _pager_text(state))
+            _pager_text(state), *_pager_buttons(state))
 
 
 def resize_page(state, per_page):
     per_page = _as_int(per_page, DEFAULT_PAGE_SIZE)
     if not state or not state["results"]:
-        return _table_update(pd.DataFrame(columns=RESULT_COLUMNS)), "", "", {**(state or {}), "per_page": per_page}, ""
+        return (_table_update(pd.DataFrame(columns=RESULT_COLUMNS)), "", "",
+            {**(state or {}), "per_page": per_page}, "", *NO_PAGES)
     state = {**state, "per_page": per_page, "page": 0}
     table = _page_table(state["results"], state["relevance"], 0, per_page)
     return (_table_update(table), _summary_for(state), _count_for(state), state,
-            _pager_text(state))
+            _pager_text(state), *_pager_buttons(state))
 
 
 def _visibility(mode):
@@ -718,9 +779,8 @@ def _visibility(mode):
 
 
 def build_ui():
-    with gr.Blocks(title="IFDB recs") as demo:
-        gr.Markdown("# IFDB recs")
-        gr.Markdown(TAGLINE, elem_id="tagline")
+    with gr.Blocks(title="interactive fiction recs") as demo:
+        gr.Markdown("# interactive fiction recs")
         state = gr.State({"results": [], "scored": [], "relevance": {},
                           "query_key": None, "page": 0, "per_page": DEFAULT_PAGE_SIZE})
 
@@ -783,9 +843,9 @@ def build_ui():
             elem_id="results",
         )
         with gr.Row(elem_id="pager"):
-            prev = gr.Button("◀ prev", scale=1)
+            prev = gr.Button("◀ prev", scale=1, interactive=False)
             pager = gr.Markdown()
-            nxt = gr.Button("next ▶", scale=1)
+            nxt = gr.Button("next ▶", scale=1, interactive=False)
 
         # A div, not a <footer>: the CSS hides Gradio's own footer by tag name,
         # and a semantic element here would be hidden along with it.
@@ -803,14 +863,14 @@ def build_ui():
                   f_year_from, f_year_to, per_page]
         # One at a time: two CPUs shared between concurrent requests makes
         # everyone slow, whereas a queue makes the wait visible.
-        go.click(recommend, inputs, [table, note, count, state, pager], concurrency_limit=1)
+        go.click(recommend, inputs, [table, note, count, state, pager, prev, nxt], concurrency_limit=1)
         # Paging lands the reader back at the summary, not stranded at the
         # bottom of the previous page.
-        prev.click(lambda s: turn_page(s, -1), state, [table, note, count, state, pager]).then(
+        prev.click(lambda s: turn_page(s, -1), state, [table, note, count, state, pager, prev, nxt]).then(
             None, None, None, js=SCROLL_TO_SUMMARY)
-        nxt.click(lambda s: turn_page(s, +1), state, [table, note, count, state, pager]).then(
+        nxt.click(lambda s: turn_page(s, +1), state, [table, note, count, state, pager, prev, nxt]).then(
             None, None, None, js=SCROLL_TO_SUMMARY)
-        per_page.change(resize_page, [state, per_page], [table, note, count, state, pager])
+        per_page.change(resize_page, [state, per_page], [table, note, count, state, pager, prev, nxt])
     return demo
 
 

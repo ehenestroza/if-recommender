@@ -1,6 +1,6 @@
-# IFDB recs — technical notes
+# interactive fiction recs — technical notes
 
-Supplementary details for [IFDB recs](README.md). The README covers what you need to run the thing, while this covers how it works and why it is built the way it is.
+Supplementary details for [interactive fiction recs](README.md). The README covers what you need to run the thing, while this covers how it works and why it is built the way it is.
 
 Most of the design decisions below were settled by measurement rather than judgement, so each one records what was measured and what it showed, including the cases where the answer was "leave it alone".
 
@@ -21,7 +21,7 @@ Most of the design decisions below were settled by measurement rather than judge
 
 ## The data
 
-From the [IFArchive](https://ifarchive.org/if-archive/info/ifdb/) dump of the IFDB database:
+From the [IFArchive](https://ifarchive.org/indexes/if-archive/info/ifdb/) dump of the IFDB database:
 
 | Table | Rows | Role |
 |---|---|---|
