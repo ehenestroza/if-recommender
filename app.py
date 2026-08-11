@@ -262,7 +262,7 @@ h1 { font-weight: 600 !important; letter-spacing: -0.01em; margin-bottom: 0.6em 
 #results .results-table td[data-label="title"]::before { content: none; }
 #results .results-table td[data-label="#"] { order: -2; margin-right: 0.55em;
   font-weight: 700 !important; color: var(--body-text-color) !important; }
-#results .results-table td[data-label="title"] { order: -1; flex: 1 1 auto; font-size: 1.05em;
+#results .results-table td[data-label="title"] { order: -1; flex: 1 1 0%; font-size: 1.05em;
   min-width: 0; overflow: hidden; }
 @media (min-width: 1024px) {
   #results .results-table tbody { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0.85em; }
@@ -560,7 +560,7 @@ def _page_table(results, relevance, page, per_page):
         row = META.loc[gid].to_dict() if gid in META.index else {}
         rel = relevance.get(gid)
         rows.append([
-            rank,
+            f"{rank}.",
             (f'<a href="{IFDB_GAME_URL.format(gameid=gid)}" target="_blank" '
              f'rel="noopener">{escape(str(row.get("title", gid)))}</a>'),
             str(row.get("author", "")),
