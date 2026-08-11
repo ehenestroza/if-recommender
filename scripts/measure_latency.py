@@ -93,10 +93,18 @@ def main() -> None:
         reranker.model.model.to(args.device)
         query_encoder.to(args.device)
 
-    quantized = False
     if args.quantize:
         from src.pipeline.quantize import quantize_cross_encoder
-        quantized = quantize_cross_encoder(reranker.model)
+        quantize_cross_encoder(reranker.model)
+
+    # Report what the model *is*, not what was asked for. `load_artefacts`
+    # already applies `model.quantize_reranker` from config, so a run without
+    # --quantize can still be measuring a quantized model — and reporting the
+    # flag instead of the fact makes an int8 run look like an fp32 one.
+    import torch.ao.nn.quantized.dynamic as nnqd
+    n_int8 = sum(1 for m in reranker.model[0].auto_model.modules()
+                 if isinstance(m, nnqd.Linear))
+    quantized = n_int8 > 0
 
     retr = cfg["retrieval"]
     min_score = retr.get("min_retrieval_score", 0.25)
