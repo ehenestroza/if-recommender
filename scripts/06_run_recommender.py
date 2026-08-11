@@ -47,8 +47,9 @@ from src.index.faiss_index import GameIndex
 from src.pipeline.retriever import Retriever
 from src.data.preprocessor import (
     SYSTEM_GENRE_SEPARATORS, TAG_SEPARATORS,
-    build_author_profiles, build_display_map, clean_frequencies, format_display,
-    format_profile_text, author_game_map, parse_profile_text, profile_display,
+    build_author_profiles, build_display_map, clean_description, clean_frequencies,
+    format_display, format_profile_text, author_game_map, parse_profile_text,
+    profile_display,
 )
 from src.data.pickers import (
     author_choices, game_choices, reviewer_choices, vocab_choices,
@@ -388,6 +389,21 @@ def load_artefacts(cfg: dict):
         game_docs[f"{column}_display"] = game_docs[column].apply(
             lambda raw, m=display_map, s=separators: format_display(raw, m, s)
         )
+    # Descriptions are not in game_docs: they are display text, never model
+    # input, so preprocessing had no reason to carry them through. Read the two
+    # columns that matter straight from the source table and clean the markup
+    # once here, rather than on every render.
+    games_path = data_dir / "games.parquet"
+    if games_path.exists():
+        raw_desc = pd.read_parquet(games_path, columns=["gameid", "desc"])
+        by_id = dict(zip(raw_desc["gameid"], raw_desc["desc"]))
+        game_docs["description"] = [clean_description(by_id.get(g, ""))
+                                    for g in game_docs["gameid"]]
+        logger.info("Loaded %d game descriptions", int((game_docs["description"] != "").sum()))
+    else:
+        game_docs["description"] = ""
+        logger.warning("games.parquet missing — descriptions will be blank")
+
     user_profiles = pd.read_parquet(data_dir / "user_profiles_retrieval.parquet")
 
     doc_map     = dict(zip(game_docs["gameid"],     game_docs["doc_text"]))

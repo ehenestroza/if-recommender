@@ -53,13 +53,20 @@ MODES = ["game", "author", "reviewer", "vibe"]
 # cannot drift. There is no column-width table any more: results render as
 # cards at every width, so nothing is apportioning a fixed share of a row.
 #
+# Ordered the way a scanning eye needs it, and grouped by kind: identity
+# (title, author, year), then signals (relevance, then rating), then
+# classification (system, genre), then the two prose blocks last. Prose reads
+# slowest, so putting it above the cheap identifying facts stalls the eye on
+# every card; keeping description and tags adjacent also gives the fixed-height
+# card a consistent rhythm — six short rows, then two text blocks.
+#
 # The blended score is deliberately absent. It answered "match plus quality" in
 # one number that nobody could decompose, and ordering by it pushed already
 # well-loved games up — the opposite of what a discovery tool is for. Relevance
 # alone is what a reader can act on, and rating is right there beside it for
 # anyone who wants to weigh it themselves.
-RESULT_COLUMNS = ["#", "relevance", "rating", "title",
-                  "author", "year", "system", "genre", "tags"]
+RESULT_COLUMNS = ["#", "title", "author", "year", "relevance", "rating",
+                  "system", "genre", "description", "tags"]
 # Even sizes only, and no 25. Results are two-up above 1024px, so an odd page
 # size leaves a lone card in the last row with an empty slot beside it — which
 # reads as "that is all there is" even when more pages follow.
@@ -245,6 +252,9 @@ h1 { font-weight: 600 !important; letter-spacing: -0.01em; margin-bottom: 0.6em 
 #results .results-table td[data-label="tags"] .v { white-space: normal;
   display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 5;
   line-clamp: 5; height: 7.5em; }
+#results .results-table td[data-label="description"] .v { white-space: normal;
+  display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2;
+  line-clamp: 2; height: 3em; }
 #results .results-table td[data-label="#"],
 #results .results-table td[data-label="title"] {
   display: block; flex: 0 1 auto; padding-bottom: 0.3em; }
@@ -551,14 +561,15 @@ def _page_table(results, relevance, page, per_page):
         rel = relevance.get(gid)
         rows.append([
             rank,
-            "–" if rel is None else f"{rel:.2f}",
-            pipeline._rating_cell(row),
             (f'<a href="{IFDB_GAME_URL.format(gameid=gid)}" target="_blank" '
              f'rel="noopener">{escape(str(row.get("title", gid)))}</a>'),
             str(row.get("author", "")),
             str(row.get("year", "")),
+            "–" if rel is None else f"{rel:.2f}",
+            pipeline._rating_cell(row),
             str(row.get("system_display", row.get("system", ""))),
             str(row.get("genre_display", row.get("genre", ""))),
+            str(row.get("description", "")),
             str(row.get("tags_display", row.get("tags", ""))),
         ])
     return pd.DataFrame(rows, columns=RESULT_COLUMNS)

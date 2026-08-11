@@ -2,6 +2,7 @@
 
 import logging
 import re
+from html import unescape
 from collections import Counter
 from typing import Dict, List, Optional, Tuple
 
@@ -84,6 +85,37 @@ def build_display_map(
         key: (min(counter.items(), key=lambda kv: (-kv[1], kv[0]))[0], game_counts[key])
         for key, counter in casings.items()
     }
+
+
+# IFDB descriptions are author-written HTML: about 12% carry <p>, <br>, <i> or
+# <b>, and some carry entities. They are display text only — never model input —
+# so nothing upstream had reason to clean them, and rendering them escaped would
+# show the tags literally.
+_MARKUP_BREAK = re.compile(r"<\s*(br|/p|/div|/li|/h[1-6])\s*/?>", re.I)
+_MARKUP_TAG = re.compile(r"<[^>]*>")
+_WHITESPACE = re.compile(r"\s+")
+
+
+def clean_description(raw) -> str:
+    """
+    IFDB's HTML description to a single line of plain text.
+
+    Block-level ends become spaces before tags are stripped, or the last word of
+    a paragraph would be glued to the first word of the next. Entities are
+    unescaped here because the renderer escapes on the way out — leaving them
+    would double-encode and show `&amp;amp;`.
+    """
+    text = str(raw or "")
+    if not text.strip():
+        return ""
+    text = _MARKUP_BREAK.sub(" ", text)
+    text = _MARKUP_TAG.sub("", text)
+    # Strip again after unescaping: a few descriptions are double-encoded, so
+    # `&lt;p&gt;` only becomes a tag once entities are resolved. The tag pattern
+    # requires a letter after `<`, so this leaves author-written `a < b` and
+    # `<3` intact.
+    text = _MARKUP_TAG.sub("", unescape(text))
+    return _WHITESPACE.sub(" ", text).strip()
 
 
 def format_display(
