@@ -48,8 +48,8 @@ from src.pipeline.retriever import Retriever
 from src.data.preprocessor import (
     SYSTEM_GENRE_SEPARATORS, TAG_SEPARATORS,
     build_author_profiles, build_display_map, clean_description, clean_frequencies,
-    format_display, format_profile_text, author_game_map, parse_profile_text,
-    profile_display,
+    drop_non_games, format_display, format_profile_text, author_game_map,
+    parse_profile_text, profile_display,
 )
 from src.data.pickers import (
     author_choices, game_choices, reviewer_choices, vocab_choices,
@@ -276,7 +276,7 @@ def _parse_filters(raw: str) -> dict:
     return filters
 
 
-def load_precomputed(path: Path, key_col: str) -> dict:
+def load_precomputed(path: Path, key_col: str, excluded: Optional[set] = None) -> dict:
     """
     Load a precomputed ranking file into {key: (gameids, scores, relevances)}.
 
@@ -293,6 +293,14 @@ def load_precomputed(path: Path, key_col: str) -> dict:
         logger.warning("Ignoring unreadable %s (%s) — scoring live instead",
                        path.name, type(exc).__name__)
         return {}
+    if excluded:
+        # These tables are built offline against the full corpus, so they still
+        # rank entries that are no longer displayable.
+        before = len(frame)
+        frame = frame[~frame["gameid"].isin(excluded)]
+        if len(frame) < before:
+            logger.info("%s: dropped %d excluded rows", path.name, before - len(frame))
+
     table = {
         key: (grp["gameid"].tolist(), grp["score"].to_numpy(), grp["relevance"].to_numpy())
         for key, grp in frame.groupby(key_col, sort=False)
@@ -374,6 +382,13 @@ def load_artefacts(cfg: dict):
 
     logger.info("Loading game docs and user profiles …")
     game_docs     = pd.read_parquet(data_dir / "game_docs_retrieval.parquet")
+
+    # Drop "not a game" entries first, so everything derived below — pickers,
+    # author profiles, the system/tag vocabularies, the display maps — is built
+    # without them rather than having to filter them out again later.
+    game_docs, excluded_games = drop_non_games(game_docs)
+    if excluded_games:
+        logger.info("Excluded %d entries tagged 'not a game'", len(excluded_games))
 
     # Precompute the display form of each free-text field once, rather than
     # reformatting on every render. System and genre also split on "/", which
@@ -485,9 +500,12 @@ def load_artefacts(cfg: dict):
 
     # Precomputed rankings for the enumerable query modes; absent files simply
     # mean those modes fall back to scoring live.
-    precomputed_user = load_precomputed(data_dir / "precomputed_userid.parquet", "userid")
-    precomputed_game = load_precomputed(data_dir / "precomputed_gameid.parquet", "seed_gameid")
-    precomputed_author = load_precomputed(data_dir / "precomputed_authorid.parquet", "authorid")
+    precomputed_user = load_precomputed(data_dir / "precomputed_userid.parquet", "userid",
+                                        excluded_games)
+    precomputed_game = load_precomputed(data_dir / "precomputed_gameid.parquet", "seed_gameid",
+                                        excluded_games)
+    precomputed_author = load_precomputed(data_dir / "precomputed_authorid.parquet", "authorid",
+                                          excluded_games)
 
     return (
         retriever, reranker, query_encoder,
@@ -721,6 +739,10 @@ def run_interactive(
             # reranking would hide most of what the reranker would have chosen —
             # and would make a filter change which candidates get scored at all.
             candidates = retriever.index.search(emb, min_score=min_score)
+            # Same reason as the web app: the index predates the load-time
+            # exclusion, so anything missing from game_info_map is not showable.
+            if game_info_map is not None:
+                candidates = [(gid, s) for gid, s in candidates if gid in game_info_map]
             if seen_games:
                 candidates = [(gid, s) for gid, s in candidates if gid not in seen_games]
 

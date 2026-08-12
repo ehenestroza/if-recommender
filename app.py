@@ -96,6 +96,11 @@ PICK_HINT = "choose one or more"
 # substring, so they carry the same hint — documenting it on only one would
 # imply the others behave differently.
 FREE_TEXT_HINT = "type text fragments and press return · case insensitive"
+# Shown when IFDB simply has no value for a field — 27% of games have no genre,
+# and a couple of hundred lack a system or year. Every field reserves its line
+# on a card, so a blank value reads as a rendering fault; an em dash reads as
+# "not recorded". Matches what the rating cell already does for unrated games.
+MISSING = "—"
 RATING_CHOICES = [round(0.5 * i, 1) for i in range(10)]      # 0.0 … 4.5
 RATING_COUNT_CHOICES = [0, 1, 2, 5, 10, 25, 50]
 
@@ -468,7 +473,12 @@ def _rank(query_text, emb, exclude, cached):
         return list(zip(gids, scores)), dict(zip(gids, rels))
 
     candidates = RETRIEVER.index.search(emb, min_score=RETR.get("min_retrieval_score", 0.25))
-    candidates = [(g, s) for g, s in candidates if g not in exclude]
+    # GAME_INFO_MAP is the authority on what can be shown: the FAISS index was
+    # built offline over the full corpus, so it still returns entries dropped at
+    # load time for being tagged "not a game". Without this they would reach the
+    # page and render with a raw id in place of a title.
+    candidates = [(g, s) for g, s in candidates
+                  if g not in exclude and g in GAME_INFO_MAP]
     if not candidates:
         return [], {}
 
@@ -562,6 +572,11 @@ def _table_update(frame):
     return f'<table class="results-table"><tbody>{"".join(body)}</tbody></table>'
 
 
+def _or_dash(value) -> str:
+    text = str(value or "").strip()
+    return text if text else MISSING
+
+
 def _page_table(results, relevance, page, per_page):
     start = page * per_page
     rows = []
@@ -572,14 +587,14 @@ def _page_table(results, relevance, page, per_page):
             f"{rank}.",
             (f'<a href="{IFDB_GAME_URL.format(gameid=gid)}" target="_blank" '
              f'rel="noopener">{escape(str(row.get("title", gid)))}</a>'),
-            str(row.get("author", "")),
-            str(row.get("year", "")),
-            "–" if rel is None else f"{rel:.2f}",
-            pipeline._rating_cell(row),
-            str(row.get("system_display", row.get("system", ""))),
-            str(row.get("genre_display", row.get("genre", ""))),
-            str(row.get("description", "")),
-            str(row.get("tags_display", row.get("tags", ""))),
+            _or_dash(row.get("author")),
+            _or_dash(row.get("year")),
+            MISSING if rel is None else f"{rel:.2f}",
+            _or_dash(pipeline._rating_cell(row)),
+            _or_dash(row.get("system_display", row.get("system"))),
+            _or_dash(row.get("genre_display", row.get("genre"))),
+            _or_dash(row.get("description")),
+            _or_dash(row.get("tags_display", row.get("tags"))),
         ])
     return pd.DataFrame(rows, columns=RESULT_COLUMNS)
 

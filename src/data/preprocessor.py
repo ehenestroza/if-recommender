@@ -96,6 +96,36 @@ _MARKUP_TAG = re.compile(r"<[^>]*>")
 _WHITESPACE = re.compile(r"\s+")
 
 
+# IFDB lets the community tag an entry "not a game": tools, indexes, reviews of
+# other games, language toys. They are legitimate IFDB records but nothing to
+# recommend playing, so they are dropped everywhere at once — results, every
+# picker, and the system/tag vocabularies built from the same table.
+NOT_A_GAME_TAG = "not a game"
+
+
+def drop_non_games(game_docs: pd.DataFrame) -> Tuple[pd.DataFrame, set]:
+    """
+    Split game_docs into the entries worth recommending and the ids to suppress.
+
+    Matches a whole comma-separated tag rather than a substring, so a future tag
+    like "not a game jam" would not be swept up, and reads both the original and
+    the `_clean` column: the cleaned one folds in genre and caps at 20 tags, so
+    a long tag list could drop the marker from one but not the other.
+
+    Returns (kept rows, excluded gameids). The caller needs the id set because
+    the FAISS index and the precomputed tables are built offline and still
+    contain these games.
+    """
+    def tagged(value) -> bool:
+        return any(part.strip().lower() == NOT_A_GAME_TAG
+                   for part in str(value or "").split(","))
+
+    flagged = (game_docs["tags"].map(tagged)
+               | game_docs.get("tags_clean", game_docs["tags"]).map(tagged))
+    excluded = set(game_docs.loc[flagged, "gameid"])
+    return game_docs.loc[~flagged].copy(), excluded
+
+
 def clean_description(raw) -> str:
     """
     IFDB's HTML description to a single line of plain text.
