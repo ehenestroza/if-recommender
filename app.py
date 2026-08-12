@@ -72,6 +72,7 @@ RESULT_COLUMNS = ["#", "title", "author", "year", "relevance", "rating",
 # reads as "that is all there is" even when more pages follow.
 PAGE_SIZES = [10, 20, 50]
 DEFAULT_PAGE_SIZE = 20
+SCROLL_TO_TOP = "() => window.scrollTo({top: 0, behavior: 'smooth'})"
 SCROLL_TO_SUMMARY = ("() => { const el = document.getElementById('summary');"
                      " if (el) el.scrollIntoView({behavior: 'smooth', block: 'start'}); }")
 ANY_LABEL = "any"
@@ -214,7 +215,8 @@ FOOTER_HTML = (
 # to `calc(50% - 0.5px)` so two of them plus the gap come to exactly 100%.
 CSS = """
 :root, .gradio-container { font-family: "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace !important; }
-.gradio-container { max-width: 1280px !important; margin: 0 auto !important;
+.gradio-container { max-width: 1280px !important; width: 100% !important;
+  margin: 0 auto !important;
   padding: 1.2em clamp(0.25rem, 1.5vw, 1.6em) !important; box-sizing: border-box !important;
   --block-radius: 10px; --block-border-width: 1px;
   --block-border-color: rgba(128,128,128,0.16);
@@ -230,6 +232,13 @@ CSS = """
   padding-right: clamp(0.25rem, 1.5vw, var(--size-8)) !important;
   max-width: 100% !important; }
 h1 { font-weight: 600 !important; letter-spacing: -0.01em; margin-bottom: 0.6em !important; }
+#home-title { background: none !important; border: none !important; box-shadow: none !important;
+  padding: 0 !important; margin: 0 0 0.6em !important; width: auto !important;
+  min-width: 0 !important; min-height: 0 !important; text-align: left !important;
+  justify-content: flex-start !important; align-self: flex-start !important;
+  font-size: 26px !important; font-weight: 600 !important; letter-spacing: -0.01em;
+  color: var(--body-text-color) !important; }
+#home-title:hover { opacity: 0.65; }
 #results { border: none !important; background: none !important; box-shadow: none !important;
   padding: 0 !important; }
 #results .html-container { padding: 0 !important; }
@@ -785,13 +794,44 @@ def resize_page(state, per_page):
             _pager_text(state), *_pager_buttons(state))
 
 
+def _reset():
+    """
+    Put every control back to how the page loads, without a reload.
+
+    Clicking the title is a "go home" instinct, and a plain link to `/` would
+    honour it — but the page ships every picker's options inline, so a reload
+    re-pays the download and the client-side render the `game` picker's hint
+    warns about. Resetting in place is instant.
+
+    The returned order matches the outputs list at the click binding exactly;
+    the pickers carry `visible` as well as a value because `mode` is being set
+    programmatically here, and relying on its change event to fix visibility
+    would leave whichever picker was open still showing.
+    """
+    blank = pd.DataFrame(columns=RESULT_COLUMNS)
+    fresh = {"results": [], "scored": [], "relevance": {},
+             "query_key": None, "page": 0, "per_page": DEFAULT_PAGE_SIZE}
+    return [
+        "game",                                          # mode
+        gr.update(value=None, visible=True),             # game
+        gr.update(value=None, visible=False),            # author
+        gr.update(value=None, visible=False),            # user
+        gr.update(value=[], visible=False),              # systems
+        gr.update(value=[], visible=False),              # tags
+        *FILTER_DEFAULTS,                                # the eight filters
+        DEFAULT_PAGE_SIZE,                               # per_page
+        _table_update(blank), "", "", fresh, "",         # results, summary, count, state, pager
+        *NO_PAGES,                                       # prev, next
+    ]
+
+
 def _visibility(mode):
     return [gr.update(visible=(mode == m)) for m in ("game", "author", "reviewer", "vibe", "vibe")]
 
 
 def build_ui():
     with gr.Blocks(title="IF recommender") as demo:
-        gr.Markdown("# IF recommender")
+        home = gr.Button("IF recommender", elem_id="home-title")
         state = gr.State({"results": [], "scored": [], "relevance": {},
                           "query_key": None, "page": 0, "per_page": DEFAULT_PAGE_SIZE})
 
@@ -867,6 +907,11 @@ def build_ui():
         # Resets the controls only; the results on screen stay until the user
         # asks for them again, so nothing changes under them unexpectedly.
         reset_filters.click(lambda: FILTER_DEFAULTS, None, filter_controls)
+
+        home.click(_reset, None,
+                   [mode, game, author, user, systems, tags, *filter_controls,
+                    per_page, table, note, count, state, pager, prev, nxt]).then(
+            None, None, None, js=SCROLL_TO_TOP)
 
         mode.change(_visibility, mode, [game, author, user, systems, tags])
         inputs = [state, mode, game, author, user, systems, tags,
