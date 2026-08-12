@@ -131,7 +131,7 @@ def _data_through(iso: str) -> str:
 # in the repository. Rendered with sanitize_html=False so target/rel survive;
 # safe because every part is a literal constant.
 FOOTER_HTML = (
-    f'by Enrique · {_link(REPO_URL, "source on GitHub")}'
+    f'by Enrique · {_link(REPO_URL, "source/docs on GitHub")}'
     f' · {_link(LICENSE_URL, "MIT licence")}<br>'
     f'game data from {_link(IFDB_URL, "IFDB")}'
     f', via the {_link(IFARCHIVE_URL, "IF Archive")}'
@@ -308,7 +308,7 @@ h1 { font-weight: 600 !important; letter-spacing: -0.01em; margin-bottom: 0.6em 
    size, so changing the text size would silently shift the indent too. */
 /* Page background, not the group's fill, so the line does not read as an input.
    Uses the theme variable so it stays correct in dark mode too. */
-.filter-hint { padding: 0.55em 0 0.6em 1rem !important; margin: 0 !important;
+.filter-hint { padding: var(--spacing-xl, 14px) 0 0.6em 1rem !important; margin: 0 !important;
   background: var(--block-background-fill) !important; }
 .filter-hint .filter-hint { padding: 0 !important; background: none !important; }
 /* Size the text only, never the wrapper too — em on both compounds. */
