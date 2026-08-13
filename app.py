@@ -66,13 +66,20 @@ MODES = ["game", "author", "reviewer", "vibe"]
 # alone is what a reader can act on, and rating is right there beside it for
 # anyone who wants to weigh it themselves.
 RESULT_COLUMNS = ["#", "title", "author", "year", "relevance", "rating",
-                  "system", "genre", "description", "tags"]
+                  "system", "language", "genre", "description", "tags"]
 # Even sizes only, and no 25. Results are two-up above 1024px, so an odd page
 # size leaves a lone card in the last row with an empty slot beside it — which
 # reads as "that is all there is" even when more pages follow.
 PAGE_SIZES = [10, 20, 50]
 DEFAULT_PAGE_SIZE = 20
 SCROLL_TO_TOP = "() => window.scrollTo({top: 0, behavior: 'smooth'})"
+# Collapsing the filter block has to happen in the browser. An Accordion opened
+# by the reader is opened client-side only — the server still holds `open=False`
+# — so returning that same value produces no diff and nothing moves. Clicking
+# the header is what the reader would do, and it goes through the component's
+# own toggle rather than around it.
+COLLAPSE_FILTERS = ("() => { const w = document.querySelector('#filters-block .label-wrap');"
+                    " if (w && w.classList.contains('open')) w.click(); }")
 SCROLL_TO_SUMMARY = ("() => { const el = document.getElementById('summary');"
                      " if (el) el.scrollIntoView({behavior: 'smooth', block: 'start'}); }")
 ANY_LABEL = "any"
@@ -101,6 +108,12 @@ FREE_TEXT_HINT = "type text fragments and press return · case insensitive"
 # on a card, so a blank value reads as a rendering fault; an em dash reads as
 # "not recorded". Matches what the rating cell already does for unrated games.
 MISSING = "—"
+# Shown when a mode has nothing to search on yet — by `recommend` when the
+# button is pressed early, and by `_mode_changed` the moment a mode is picked.
+MODE_PROMPTS = {"game": "Pick a game to get recommendations like it.",
+                "author": "Pick an author.",
+                "reviewer": "Pick a reviewer.",
+                "vibe": "Pick at least one system or tag."}
 RATING_CHOICES = [round(0.5 * i, 1) for i in range(10)]      # 0.0 … 4.5
 RATING_COUNT_CHOICES = [0, 1, 2, 5, 10, 25, 50]
 
@@ -304,11 +317,16 @@ h1 { font-weight: 600 !important; letter-spacing: -0.01em; margin-bottom: 0.6em 
   color: var(--body-text-color) !important; font-weight: 500 !important; }
 .block-header .block-header { border-bottom: none !important; padding: 0 !important;
   background: none !important; }
-#filters-head { background: var(--block-background-fill) !important;
-  border-radius: 10px 10px 0 0 !important;
-  border-bottom: 1px solid rgba(128,128,128,0.16) !important; }
-#filters-head .block-header { background: none !important; border-bottom: none !important;
-  border-radius: 0 !important; }
+#filters-block { padding: 0 !important; }
+#filters-block .label-wrap { padding: 0.65em 0.85em 0.6em !important; margin: 0 !important; }
+#filters-block .label-wrap, #filters-block .label-wrap span {
+  font-size: 1.05em !important; font-weight: 500 !important; letter-spacing: 0.03em;
+  color: var(--body-text-color) !important; }
+#filters-block .label-wrap:hover { background: rgba(128,128,128,0.05) !important; }
+#filters-block .label-wrap.open { border-bottom: 1px solid rgba(128,128,128,0.16) !important; }
+#filters-block .column { gap: 0 !important; }
+#filters-head { background: none !important; border: none !important;
+  padding: 0 0.5em 0 0 !important; }
 /* Padding in rem, not em: em would be relative to this element's own font
    size, so changing the text size would silently shift the indent too. */
 /* Page background, not the group's fill, so the line does not read as an input.
@@ -329,6 +347,14 @@ h1 { font-weight: 600 !important; letter-spacing: -0.01em; margin-bottom: 0.6em 
 #summary p { margin: 0.2em 0 !important; }
 #summary code { background: var(--block-background-fill) !important;
   border: 1px solid rgba(128,128,128,0.18) !important; }
+/* Same slab as the summary, minus the rule above it: this one sits under the
+   filters, where a separator would read as a second section starting. */
+#notice:has(p) { margin: 1.6em 0 0.2em !important;
+  padding: 0.9em 1.05em !important; border-radius: 10px !important;
+  background: linear-gradient(rgba(128,128,128,0.10), rgba(128,128,128,0.10)),
+    var(--block-background-fill) !important;
+  border: 1px solid rgba(128,128,128,0.14) !important; }
+#notice p { margin: 0.2em 0 !important; }
 #result-count { margin: 1.4em 0 0 !important; }
 #result-count p { margin: 0 !important; font-size: 0.92em !important; opacity: 0.6; }
 #pager:not(:has(.md p)) { display: none !important; }
@@ -352,6 +378,14 @@ footer { display: none !important; }
   .control-row > * > * {
     flex: 1 1 calc(50% - 0.5px) !important;
     max-width: calc(50% - 0.5px) !important;
+  }
+  /* Five filters over two columns leave the fifth alone on the last row, at
+     half width with the group's grey showing beside it. An odd-numbered last
+     child is exactly that case — the four-filter row below is even and keeps
+     its columns. Wider viewports already do this on their own: without the
+     max-width above, the trailing block simply grows into the space. */
+  .control-row > * > *:last-child:nth-child(odd) {
+    flex-basis: 100% !important; max-width: 100% !important;
   }
   #action-row { flex-wrap: wrap !important; }
   #action-row > * { flex: 1 1 100% !important; max-width: 100% !important; }
@@ -445,7 +479,11 @@ YEAR_MAX, YEAR_MIN = YEAR_CHOICES[0], YEAR_CHOICES[-1]
 # rating clears both without being a quality bar in any real sense — and because
 # `min_rating` also drops games nobody has rated, lowering rating to 0.0 is what
 # opens the genuinely unknown tail to anyone who wants it.
-FILTER_DEFAULTS = ([], [], [], [], 3.0, 1, YEAR_MIN, YEAR_MAX)
+# Ordered as the card is: author, system, language, then genre and tags as the
+# single field they are presented as, then the numeric ones in card order too.
+# Index positions are load-bearing — the reset button and `_build_filters` both
+# unpack this positionally.
+FILTER_DEFAULTS = ([], [], [], [], YEAR_MIN, YEAR_MAX, 3.0, 1)
 
 
 # ---------------------------------------------------------------------------
@@ -592,6 +630,7 @@ def _page_table(results, relevance, page, per_page):
             MISSING if rel is None else f"{rel:.2f}",
             _or_dash(pipeline._rating_cell(row)),
             _or_dash(row.get("system_display", row.get("system"))),
+            _or_dash(row.get("language")),
             _or_dash(row.get("genre_display", row.get("genre"))),
             _or_dash(row.get("description")),
             _or_dash(row.get("tags_display", row.get("tags"))),
@@ -671,48 +710,291 @@ def _pager_buttons(state):
 
 NO_PAGES = (gr.update(interactive=False), gr.update(interactive=False))
 
+# Filters have nothing to narrow until a query returns something, so the block
+# stays hidden and its choices are left untouched.
+NO_FILTERS = (gr.update(visible=False), *(gr.update() for _ in range(8)))
 
-def _build_filters(genre, system, author, tags, rating, count, year_from, year_to):
-    """Turn the filter dropdowns into apply_hard_filters kwargs."""
+
+# gameid -> the display-cased values each dynamic filter can offer for it.
+# Built once: deriving this per request would mean a META.loc lookup for every
+# row of a 500-result pool on every filter change.
+def _split(value) -> list:
+    return [p.strip() for p in str(value or "").split(",") if p.strip()]
+
+
+# One display spelling per value, shared by genre and tags because the filter
+# offers them as one list. The tag column's casing wins wherever a value appears
+# in both, with genre filling in the rest.
+#
+# Not the commoner of the two spellings, which is the obvious rule and the wrong
+# one: "Horror" outnumbers "horror" corpus-wide (938 games to 806) while
+# "comedy" beats "Comedy" (196 to 73), so frequency alone puts a capitalised
+# word next to a lowercase one and the list still looks unedited. Deferring to
+# tags picks one convention and holds it — and it is the convention the vibe
+# picker already shows, so the same value reads the same in both places.
+TOPIC_CASING = {**GENRE_CASING, **TAG_CASING}
+
+
+def _canonical_topic(part: str) -> str:
+    entry = TOPIC_CASING.get(part.lower())
+    return entry[0] if entry else part
+
+
+def _merged_topics(genre, tags) -> list:
+    """
+    A game's genre and tag values as the one list the filter presents.
+
+    Deduped case-insensitively, because IFDB frequently records the same idea in
+    both fields — "Fantasy" as a genre and "fantasy" as a tag — and offering
+    each casing separately would put two entries in the dropdown that do the
+    same thing. The cards go on showing the two fields apart; only the filter
+    joins them, which is how the matching has always worked.
+    """
+    seen, out = set(), []
+    for part in _split(genre) + _split(tags):
+        key = part.lower()
+        if key not in seen:
+            seen.add(key)
+            out.append(_canonical_topic(part))
+    return out
+
+
+_FILTER_VALUES = {
+    r.gameid: {
+        "system": _split(getattr(r, "system_display", "")),
+        "author": _split(r.author),
+        "language": _split(r.language),
+        "genre_tags": _merged_topics(getattr(r, "genre_display", ""),
+                                     getattr(r, "tags_display", "")),
+    }
+    for r in GAME_DOCS.itertuples(index=False)
+}
+
+
+def _year_span(results):
+    """
+    The year range a result set covers, as (low, high).
+
+    Continuous, gaps included: the corpus has no 1968 or 1971-1976, and a
+    dropdown that skips the years between its ends looks broken rather than
+    precise. Falls back to the corpus span when nothing is dated.
+    """
+    years = [int(y) for y in
+             (str(GAME_INFO_MAP.get(gid, {}).get("year", "")).strip() for gid, _ in results)
+             if y.isdigit()]
+    return (min(years), max(years)) if years else (YEAR_MIN, YEAR_MAX)
+
+
+def _ladder_window(ladder, observed):
+    """
+    Trim a fixed ladder of thresholds to the rungs that change anything.
+
+    A rung above everything observed returns nothing. A rung below the lowest
+    observed value returns exactly what the next rung up returns. Both are dead
+    clicks, so the window runs from the highest rung at or below the minimum to
+    the highest rung at or below the maximum: counts of 2, 3, 8, 10, 12 against
+    [0, 1, 2, 5, 10, 25, 50] leave [2, 5, 10].
+    """
+    if not observed:
+        return list(ladder)
+    lo, hi = min(observed), max(observed)
+    floor = max((v for v in ladder if v <= lo), default=ladder[0])
+    return [v for v in ladder if floor <= v <= hi] or [floor]
+
+
+def _clamp_to(window, value):
+    """The nearest offered rung to a value that may have fallen outside it."""
+    if value in window:
+        return value
+    number = _as_float(value, None)
+    if number is None:
+        return window[0]
+    return window[0] if number < float(window[0]) else window[-1]
+
+
+def _rating_ladders(pool):
+    """
+    The rating and rating-count rungs worth offering for a scored pool.
+
+    Derived from the pool rather than from the results on screen, because the
+    results on screen have always had the rating filter applied to them: rungs
+    read back off them would start at the 3.0 default, so the filter could only
+    ever be tightened and the tail below it would be unreachable. The pool is
+    the same set before these two thresholds touched it.
+    """
+    counts, ratings, unrated = [], [], False
+    for gid, _ in pool:
+        info = GAME_INFO_MAP.get(gid) or {}
+        try:
+            n = int(info.get("review_count") or 0)
+        except (TypeError, ValueError):
+            n = 0
+        counts.append(n)
+        if not n:
+            unrated = True
+            continue
+        try:
+            ratings.append(float(info.get("avg_rating")))
+        except (TypeError, ValueError):
+            pass
+    rating = _ladder_window(RATING_CHOICES, ratings)
+    # 0.0 is not a threshold like the others: it turns the filter off entirely,
+    # and that is the only setting under which unrated games appear at all. It
+    # earns its place whenever the pool holds one, however high the rated
+    # minimum sits. The count ladder needs no such rule — an unrated game counts
+    # zero, so the 0 rung falls out of the observed values on its own.
+    if unrated and RATING_CHOICES[0] not in rating:
+        rating = [RATING_CHOICES[0], *rating]
+    return rating, _ladder_window(RATING_COUNT_CHOICES, counts)
+
+
+def _choices_from_results(results):
+    """
+    The values each dynamic filter should offer, given a result set.
+
+    Ordered by how often each appears among these results, so the most useful
+    narrowing sits at the top of the list rather than whatever happens to be
+    commonest across the whole corpus.
+
+    Deliberately computed from the *unfiltered* recommendation, not from what is
+    on screen: recomputing as filters are applied would make options vanish as
+    you use them, so unpicking a choice you just made would need options that
+    are no longer offered.
+    """
+    counters = {k: Counter() for k in ("system", "author", "language", "genre_tags")}
+    for gid, _ in results:
+        values = _FILTER_VALUES.get(gid)
+        if not values:
+            continue
+        for field, counter in counters.items():
+            counter.update(values[field])
+    return {field: [v for v, _ in c.most_common()] for field, c in counters.items()}
+
+
+def _picked(value) -> list:
+    """
+    A dropdown's value as a clean list of terms.
+
+    Opening a multiselect and dismissing it without choosing anything emits
+    `[None]` rather than `[]` — a list that is truthy but not joinable, which
+    made every filter fail at once. Single-selects arrive as a bare value or
+    None. Normalising both here keeps that shape out of the filter logic.
+    """
+    if value is None:
+        return []
+    items = value if isinstance(value, (list, tuple)) else [value]
+    return [str(v).strip() for v in items if v is not None and str(v).strip()]
+
+
+def _as_float(value, default):
+    """Coerce a dropdown value to float, for the same reasons as `_as_int`."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _build_filters(author, system, language, genre_tags, year_from, year_to,
+                   rating, count, year_bounds=None):
+    """
+    Turn the filter dropdowns into apply_hard_filters kwargs.
+
+    `year_bounds` is the span the year dropdowns are currently offering, which
+    is the result set's own range rather than the corpus's. It decides whether
+    the year filter counts as narrowed: selecting the full offered span must
+    mean "no constraint", because applying a range drops every game with no
+    recorded year — 184 of them — and the reader never asked for that.
+    """
     filters = {}
-    if genre:
-        filters["genre"] = genre
-    if system:
-        filters["system"] = system
+    author, system = _picked(author), _picked(system)
+    language, genre_tags = _picked(language), _picked(genre_tags)
     if author:
         filters["author"] = author
-    if tags:
-        filters["tags"] = ", ".join(tags)
+    if system:
+        filters["system"] = system
+    if language:
+        filters["language"] = language
+    if genre_tags:
+        # One field, matched against genre or tags. Joined rather than passed as
+        # a list because apply_hard_filters splits this one on commas.
+        filters["genre_tags"] = ", ".join(genre_tags)
+    rating, count = _as_float(rating, 0.0), _as_int(count, 0)
     if rating:
-        filters["min_rating"] = float(rating)
+        filters["min_rating"] = rating
     if count:
-        filters["min_rating_count"] = int(count)
-    # Only constrain years if the user actually narrowed the span. The dropdowns
-    # default to the full range for legibility, but applying it would silently
-    # drop the 184 games with no recorded year — apply_hard_filters excludes a
-    # game it cannot date.
-    low = int(year_from) if year_from else YEAR_MIN
-    high = int(year_to) if year_to else YEAR_MAX
-    if low > YEAR_MIN or high < YEAR_MAX:
+        filters["min_rating_count"] = count
+    lo_bound, hi_bound = year_bounds or (YEAR_MIN, YEAR_MAX)
+    low = _as_int(year_from, lo_bound) if year_from else lo_bound
+    high = _as_int(year_to, hi_bound) if year_to else hi_bound
+    if low > lo_bound or high < hi_bound:
         filters["year_range"] = f"{low}-{high}"
     return filters
 
 
 def recommend(state, mode, game, author, user, systems, tags,
-              f_genre, f_system, f_author, f_tags, f_rating, f_count,
-              f_year_from, f_year_to, per_page):
-    """Resolve the chosen mode to a query, rank, and render the first page."""
+              f_author, f_system, f_language, f_topics,
+              f_year_from, f_year_to, f_rating, f_count, per_page, announce=False):
+    """
+    Resolve the chosen mode to a query, rank, and render the first page.
+
+    Runs on two occasions that need different treatment. A *new* query starts
+    from a clean filter state: the categorical filters are ignored for this
+    render and reset on screen, because values carried over from the previous
+    search may not exist among these results at all. A *filter change* on the
+    same query reuses the scored pool and honours what the user picked, leaving
+    the offered choices alone so nothing shifts under them mid-narrowing.
+
+    `announce` marks the run as a response to the recommend button, and only
+    those may tell the reader to pick something first. The same function also
+    runs whenever a filter moves — including the moves it makes itself when a
+    mode change resets them — and a prompt appearing then answers a question
+    nobody asked.
+    """
     blank = pd.DataFrame(columns=RESULT_COLUMNS)
     empty_state = {"results": [], "scored": [], "relevance": {},
                    "query_key": None, "page": 0, "per_page": per_page}
     per_page = _as_int(per_page, DEFAULT_PAGE_SIZE)
-    hard_filters = _build_filters(f_genre, f_system, f_author, f_tags,
-                                  f_rating, f_count, f_year_from, f_year_to)
+
+    def nothing(message):
+        """Clear the page and say why — or say nothing, if nobody asked."""
+        if not announce:
+            return (gr.skip(),) * 17
+        return (_table_update(blank), "", "", empty_state, message, "",
+                *NO_PAGES, *NO_FILTERS)
+
+    # Decided before filtering, because it governs whether the categorical
+    # filters apply at all.
+    systems, tags = _picked(systems), _picked(tags)
+    query_key = (mode, game, author, user, tuple(systems), tuple(tags))
+    reused = bool(state) and state.get("query_key") == query_key and state.get("scored")
+    # Setting nine controls at the end of a run makes nine change events, each
+    # re-entering here with the values just written. They cannot alter anything,
+    # so recognise them and return before doing any work — otherwise one query
+    # re-filters and re-renders the page nine times over.
+    applied = (_picked(f_author), _picked(f_system), _picked(f_language),
+               _picked(f_topics),
+               _as_int(f_year_from, None), _as_int(f_year_to, None),
+               _as_float(f_rating, None), _as_int(f_count, None))
+    if reused and state.get("results") and state.get("applied") == applied:
+        logger.debug("echo of our own filter values — nothing to do")
+        return (gr.skip(),) * 17
+
+    if not reused:
+        f_author, f_system, f_language, f_topics = [], [], [], []
+        f_year_from = f_year_to = None
+
+    # The year dropdowns offer this result set's own span, so "not narrowed"
+    # means its ends, not the corpus's. The span is carried in state because a
+    # filter change has to judge against the same bounds the user is seeing.
+    year_bounds = (state or {}).get("year_bounds") if reused else None
+    hard_filters = _build_filters(f_author, f_system, f_language, f_topics,
+                                  f_year_from, f_year_to, f_rating, f_count,
+                                  year_bounds)
     exclude, cached, emb, query_text = set(), None, None, ""
 
     if mode == "game":
         if not game:
-            return _table_update(blank), "Pick a game to get recommendations like it.", "", empty_state, "", *NO_PAGES
+            return nothing(MODE_PROMPTS["game"])
         query_text = GAME_QUERY_TEXT_MAP.get(game, DOC_MAP.get(game, ""))
         cached, exclude = PRE_GAME.get(game), {game}
         emb = None if cached is not None else RETRIEVER._encode_game_ids([game])
@@ -720,7 +1002,7 @@ def recommend(state, mode, game, author, user, systems, tags,
 
     elif mode == "author":
         if not author:
-            return _table_update(blank), "Pick an author.", "", empty_state, "", *NO_PAGES
+            return nothing(MODE_PROMPTS["author"])
         query_text = AUTHOR_PROFILE_MAP.get(author, "")
         cached = PRE_AUTHOR.get(author)
         exclude = set(AUTHOR_GAMES.get(author, []))
@@ -729,7 +1011,7 @@ def recommend(state, mode, game, author, user, systems, tags,
 
     elif mode == "reviewer":
         if not user:
-            return _table_update(blank), "Pick a reviewer.", "", empty_state, "", *NO_PAGES
+            return nothing(MODE_PROMPTS["reviewer"])
         query_text = PROFILE_MAP.get(user, "")
         cached = PRE_USER.get(user)
         if REVIEWS_DF is not None:
@@ -741,19 +1023,17 @@ def recommend(state, mode, game, author, user, systems, tags,
 
     else:  # vibe
         if not systems and not tags:
-            return _table_update(blank), "Pick at least one system or tag.", "", empty_state, "", *NO_PAGES
+            return nothing(MODE_PROMPTS["vibe"])
         query_text = format_profile_text(list(systems or []), list(tags or []))
         emb = QUERY_ENCODER.encode([query_text], normalize_embeddings=True)[0]
         note = "games matching this vibe"
 
     if not query_text:
-        return _table_update(blank), "No profile available for that selection.", "", empty_state, "", *NO_PAGES
+        return nothing("No profile available for that selection.")
 
     # Scoring is the expensive half and depends only on the query, never on the
     # filters. Reuse it while the user narrows results, and drop it as soon as
     # they change what they are searching for.
-    query_key = (mode, game, author, user, tuple(systems or []), tuple(tags or []))
-    reused = bool(state) and state.get("query_key") == query_key and state.get("scored")
     logger.info("query mode=%s systems=%s tags=%s | previous_key=%s | reused=%s",
                 mode, systems, tags, (state or {}).get("query_key"), bool(reused))
     if reused:
@@ -764,7 +1044,26 @@ def recommend(state, mode, game, author, user, systems, tags,
     else:
         scored, relevance = _rank(query_text, emb, exclude, cached)
     if not scored:
-        return _table_update(blank), "Nothing above the retrieval threshold for that query.", "", empty_state, "", *NO_PAGES
+        return nothing("Nothing above the retrieval threshold for that query.")
+
+    # A new query starts from the default thresholds like every other filter:
+    # carrying 4.5 into a pool topping out at 4.26 filtered away every result
+    # and left nothing on screen to relax it from. The defaults still need
+    # snapping — a pool whose games all have 19 ratings offers only the rung
+    # below that, so the default of 1 becomes 10 — and the rungs are settled
+    # before filtering, not after, so the controls and the results below them
+    # describe the same thing.
+    if reused:
+        rungs = (state or {}).get("ladders") or {}
+        rating_rungs = rungs.get("rating") or RATING_CHOICES
+        count_rungs = rungs.get("count") or RATING_COUNT_CHOICES
+    else:
+        rating_rungs, count_rungs = _rating_ladders(scored)
+        f_rating = _clamp_to(rating_rungs, FILTER_DEFAULTS[6])
+        f_count = _clamp_to(count_rungs, FILTER_DEFAULTS[7])
+        hard_filters = _build_filters(f_author, f_system, f_language, f_topics,
+                                      f_year_from, f_year_to, f_rating, f_count,
+                                      year_bounds)
 
     targets = pipeline._parse_profile_targets(query_text) if mode != "vibe" else (set(), set())
     # Ask for every result the pool can yield, then paginate locally.
@@ -774,16 +1073,65 @@ def recommend(state, mode, game, author, user, systems, tags,
         target_genres=targets[0], target_systems=targets[1],
     )
     if not results:
-        return _table_update(blank), f"{note}\n\nNo results match those filters — try relaxing them.", "", empty_state, "", *NO_PAGES
+        # Deliberately not NO_FILTERS: hiding the block here would take away the
+        # only controls that can undo the narrowing. The scored pool stays in
+        # state too, so relaxing a filter re-filters without rescoring.
+        stranded = {"results": [], "scored": scored, "relevance": relevance,
+                    "query_key": query_key, "page": 0, "per_page": per_page,
+                    "headline": note, "query_text": query_text,
+                    # The filter updates below are no-ops, so the choices on
+                    # screen are still the previous render's. Record those, not
+                    # the ones this run worked out, or the reset button will
+                    # offer a value the dropdown no longer lists.
+                    "year_bounds": (state or {}).get("year_bounds"),
+                    "ladders": (state or {}).get("ladders"),
+                    "applied": applied,
+                    "corpus_order": mode in ("game", "vibe")}
+        return (_table_update(blank),
+                _summary(note, query_text, corpus_order=mode in ("game", "vibe")), "",
+                stranded, "No results match those filters — try relaxing them.", "",
+                *NO_PAGES, gr.update(visible=True),
+                *(gr.update() for _ in range(8)))
 
     state = {"results": results, "scored": scored, "relevance": relevance,
              "query_key": query_key, "page": 0, "per_page": per_page,
              "headline": note, "query_text": query_text,
+             "year_bounds": year_bounds, "ladders": (state or {}).get("ladders"),
+             "applied": applied,
              "corpus_order": mode in ("game", "vibe")}
     summary = _summary(note, query_text, corpus_order=mode in ("game", "vibe"))
+
+    # On a new query, offer only what these results actually contain, and clear
+    # the carried-over selections. On a filter change, leave both alone.
+    if reused:
+        filter_updates = (gr.update(visible=True), *(gr.update() for _ in range(8)))
+    else:
+        choices = _choices_from_results(results)
+        low, high = state["year_bounds"] = _year_span(results)
+        years = list(range(high, low - 1, -1))
+        state["ladders"] = {"rating": rating_rungs, "count": count_rungs}
+        # What the controls will hold once this response lands — the cleared
+        # categoricals, the offered span, the snapped thresholds. The echo
+        # events arrive carrying exactly this, which is how they are known.
+        state["applied"] = ([], [], [], [], low, high, f_rating, f_count)
+        filter_updates = (
+            # Collapsed again: a new query resets every control inside, so
+            # leaving it open would show the reader a block that no longer says
+            # anything about what they just searched for.
+            gr.update(visible=True, open=False),
+            gr.update(choices=choices["author"], value=[]),
+            gr.update(choices=choices["system"], value=[]),
+            gr.update(choices=choices["language"], value=[]),
+            gr.update(choices=choices["genre_tags"], value=[]),
+            gr.update(choices=years, value=low),
+            gr.update(choices=years, value=high),
+            gr.update(choices=rating_rungs, value=f_rating),
+            gr.update(choices=count_rungs, value=f_count),
+        )
+
     return (_table_update(_page_table(results, relevance, 0, per_page)), summary,
-            _result_count(len(results), 0, per_page), state, _pager_text(state),
-            *_pager_buttons(state))
+            _result_count(len(results), 0, per_page), state, "", _pager_text(state),
+            *_pager_buttons(state), *filter_updates)
 
 
 def turn_page(state, step):
@@ -833,15 +1181,51 @@ def _reset():
         gr.update(value=None, visible=False),            # user
         gr.update(value=[], visible=False),              # systems
         gr.update(value=[], visible=False),              # tags
-        *FILTER_DEFAULTS,                                # the eight filters
+        *FILTER_DEFAULTS[:4],                            # author, system, language, genres/tags
+        gr.update(choices=YEAR_CHOICES, value=YEAR_MIN),  # year ≥, back to the
+        gr.update(choices=YEAR_CHOICES, value=YEAR_MAX),  # corpus span it loads with
+        gr.update(choices=RATING_CHOICES, value=FILTER_DEFAULTS[6]),        # and the
+        gr.update(choices=RATING_COUNT_CHOICES, value=FILTER_DEFAULTS[7]),  # full ladders
         DEFAULT_PAGE_SIZE,                               # per_page
-        _table_update(blank), "", "", fresh, "",         # results, summary, count, state, pager
+        _table_update(blank), "", "", fresh, "", "",     # results, summary, count, state, notice, pager
         *NO_PAGES,                                       # prev, next
+        gr.update(visible=False, open=False),             # the filter block
     ]
 
 
 def _visibility(mode):
     return [gr.update(visible=(mode == m)) for m in ("game", "author", "reviewer", "vibe", "vibe")]
+
+
+def _mode_changed(mode, per_page):
+    """
+    Switching mode starts a new search, so nothing from the last one survives.
+
+    The filter block is what forces this. Its choices were built from the
+    previous mode's results and its values were applied to them, so leaving
+    either in place describes something the reader is no longer looking at. The
+    results go with it: a summary reading "in the spirit of X" above an empty
+    picker, still narrowed by filters that have just been cleared, is worse than
+    a clean slate. Waiting for the recommend button would leave that mismatch on
+    screen for as long as the reader takes to choose.
+
+    It clears quietly. Prompting "pick a game" here would be answering a
+    question the reader has not asked yet — they have just told us the mode,
+    and choosing the game is plainly the next thing they were going to do.
+    """
+    fresh = {"results": [], "scored": [], "relevance": {}, "query_key": None,
+             "page": 0, "per_page": _as_int(per_page, DEFAULT_PAGE_SIZE)}
+    return [
+        *_visibility(mode),
+        *FILTER_DEFAULTS[:4],                                # the list filters
+        gr.update(choices=YEAR_CHOICES, value=YEAR_MIN),      # and the four
+        gr.update(choices=YEAR_CHOICES, value=YEAR_MAX),      # ladders, back to
+        gr.update(choices=RATING_CHOICES, value=FILTER_DEFAULTS[6]),        # their
+        gr.update(choices=RATING_COUNT_CHOICES, value=FILTER_DEFAULTS[7]),  # full spans
+        gr.update(visible=False, open=False),
+        _table_update(pd.DataFrame(columns=RESULT_COLUMNS)),
+        "", "", fresh, "", "", *NO_PAGES,   # summary, count, state, notice, pager
+    ]
 
 
 def build_ui():
@@ -864,14 +1248,31 @@ def build_ui():
                                filterable=True, visible=False)
             systems = gr.Dropdown(SYSTEM_CHOICES, value=[], label="systems", info=PICK_HINT,
                                   multiselect=True, visible=False)
-            tags = gr.Dropdown(TAG_CHOICES, value=[], label="tags", info=PICK_HINT,
+            # "genres/tags" here too, though this vocabulary is the cleaned one
+            # the encoders saw: genre values are folded into it already, and
+            # competition tags are stripped. The filter below offers the raw
+            # values instead, so the two lists differ — but both cover the same
+            # idea, and calling one "tags" made them look unrelated.
+            tags = gr.Dropdown(TAG_CHOICES, value=[], label="genres/tags", info=PICK_HINT,
                                multiselect=True, visible=False)
 
-        with gr.Group():
+        with gr.Row(elem_id="action-row"):
+            per_page = gr.Dropdown(PAGE_SIZES, value=DEFAULT_PAGE_SIZE, label="results per page", scale=1)
+            go = gr.Button("recommend", variant="primary", scale=3)
+
+        note = gr.Markdown(elem_id="summary")
+
+        # Filters live below the results they narrow, appear only once there is
+        # something to narrow, and stay collapsed until asked for. Nine controls
+        # open by default crowded the page and, in vibe mode, showed "system" and
+        # "tags" twice — once as the query and once as a filter. An accordion is
+        # the standard disclosure for this and toggles client-side, so opening it
+        # costs no round trip.
+        with gr.Accordion("result filters", open=False, visible=False,
+                          elem_id="filters-block") as filters_block:
             with gr.Row(elem_id="filters-head"):
-                gr.Markdown("result filters", elem_classes="block-header")
+                gr.Markdown(FREE_TEXT_HINT, elem_classes="filter-hint")
                 reset_filters = gr.Button("( reset )", size="sm", elem_id="reset-filters")
-            gr.Markdown(FREE_TEXT_HINT, elem_classes="filter-hint")
             # elem_classes rather than Gradio's own row class: the internal names
             # are not API and have changed between majors, whereas these are ours.
             with gr.Row(elem_classes="control-row"):
@@ -880,31 +1281,57 @@ def build_ui():
                 # allow_custom_value lets someone type a fragment and press
                 # return — "xyzzy" or "inform" then matches every value
                 # containing it, since apply_hard_filters compares by substring.
-                # Without it the dropdowns would only ever match one exact value.
-                f_genre = gr.Dropdown(GENRE_FILTER_CHOICES, value=FILTER_DEFAULTS[0], label="genre",
-                                      multiselect=True,
-                                      filterable=True, allow_custom_value=True)
-                f_system = gr.Dropdown(SYSTEM_FILTER_CHOICES, value=FILTER_DEFAULTS[1], label="system",
+                # Ordered as a card reads — author, system, language, then
+                # genre and tags together — so the eye lands in the same place
+                # in both.
+                # Multiselect throughout, and for the same reason each time:
+                # empty is how you say "any", and a single-select offers no way
+                # back to it once something is chosen.
+                f_author = gr.Dropdown([], value=FILTER_DEFAULTS[0], label="author",
                                        multiselect=True,
                                        filterable=True, allow_custom_value=True)
-                f_author = gr.Dropdown(AUTHOR_FILTER_CHOICES, value=FILTER_DEFAULTS[2], label="author",
+                f_system = gr.Dropdown([], value=FILTER_DEFAULTS[1], label="system",
                                        multiselect=True,
                                        filterable=True, allow_custom_value=True)
-                f_tags = gr.Dropdown(TAG_FILTER_CHOICES, value=FILTER_DEFAULTS[3], label="tags",
-                                     multiselect=True,
-                                     filterable=True, allow_custom_value=True)
+                f_language = gr.Dropdown([], value=FILTER_DEFAULTS[2], label="language",
+                                         multiselect=True,
+                                         filterable=True, allow_custom_value=True)
+                # Genre and tags as one control. IFDB splits the same idea
+                # across both fields — "Fantasy" is a genre on one game and a
+                # tag on the next — and the matching has always pooled them, so
+                # two filters implied a distinction the data does not keep. The
+                # cards still show the fields apart, which is where the
+                # distinction does mean something.
+                f_topics = gr.Dropdown([], value=FILTER_DEFAULTS[3], label="genres/tags",
+                                       multiselect=True,
+                                       filterable=True, allow_custom_value=True)
             with gr.Row(elem_classes="control-row"):
-                f_rating = gr.Dropdown(RATING_CHOICES, value=FILTER_DEFAULTS[4], label="rating ≥")
-                f_count = gr.Dropdown(RATING_COUNT_CHOICES, value=FILTER_DEFAULTS[5], label="rating count ≥")
-                f_year_from = gr.Dropdown(YEAR_CHOICES, value=FILTER_DEFAULTS[6], label="year ≥")
-                f_year_to = gr.Dropdown(YEAR_CHOICES, value=FILTER_DEFAULTS[7], label="year ≤")
+                # Year before rating, again as the cards read. The choices are
+                # replaced per query with the span those results cover.
+                # allow_custom_value for the same reason everywhere: Gradio
+                # rejects an incoming value that is not among the component's
+                # current choices, and these choices are rewritten on every
+                # query. The control still holds the previous render's value
+                # when it reports the change, so a query whose span excludes it
+                # — 2026 arriving at a dropdown now offering 2021 down to 1977 —
+                # was failing validation before any of our code ran, and the
+                # reader got an error toast for a query that had worked. Values
+                # are coerced where they are read instead.
+                f_year_from = gr.Dropdown(YEAR_CHOICES, value=FILTER_DEFAULTS[4],
+                                          label="year ≥", allow_custom_value=True)
+                f_year_to = gr.Dropdown(YEAR_CHOICES, value=FILTER_DEFAULTS[5],
+                                        label="year ≤", allow_custom_value=True)
+                f_rating = gr.Dropdown(RATING_CHOICES, value=FILTER_DEFAULTS[6],
+                                       label="rating ≥", allow_custom_value=True)
+                f_count = gr.Dropdown(RATING_COUNT_CHOICES, value=FILTER_DEFAULTS[7],
+                                      label="rating count ≥", allow_custom_value=True)
 
-        with gr.Row(elem_id="action-row"):
-            per_page = gr.Dropdown(PAGE_SIZES, value=DEFAULT_PAGE_SIZE, label="results per page", scale=1)
-            go = gr.Button("recommend", variant="primary", scale=3)
-
-        note = gr.Markdown(elem_id="summary")
         count = gr.Markdown(elem_id="result-count")
+        # Messages live here rather than in the summary. Folding "no results
+        # match those filters" into the profile block replaced the profile with
+        # it, so the one thing the reader needed in order to judge what to relax
+        # disappeared at exactly the moment it mattered.
+        notice = gr.Markdown(elem_id="notice")
         table = gr.HTML(
             elem_id="results",
         )
@@ -917,24 +1344,75 @@ def build_ui():
         # and a semantic element here would be hidden along with it.
         gr.Markdown(FOOTER_HTML, elem_id="page-footer", sanitize_html=False)
 
-        filter_controls = [f_genre, f_system, f_author, f_tags,
-                           f_rating, f_count, f_year_from, f_year_to]
-        # Resets the controls only; the results on screen stay until the user
-        # asks for them again, so nothing changes under them unexpectedly.
-        reset_filters.click(lambda: FILTER_DEFAULTS, None, filter_controls)
-
+        # Same order as FILTER_DEFAULTS and as `recommend`'s signature; all
+        # three are positional and must agree.
+        filter_controls = [f_author, f_system, f_language, f_topics,
+                           f_year_from, f_year_to, f_rating, f_count]
         home.click(_reset, None,
                    [mode, game, author, user, systems, tags, *filter_controls,
-                    per_page, table, note, count, state, pager, prev, nxt]).then(
-            None, None, None, js=SCROLL_TO_TOP)
+                    per_page, table, note, count, state, notice, pager, prev, nxt,
+                    filters_block]).then(
+            None, None, None, js=SCROLL_TO_TOP).then(
+            None, None, None, js=COLLAPSE_FILTERS)
 
-        mode.change(_visibility, mode, [game, author, user, systems, tags])
+        mode.change(_mode_changed, [mode, per_page],
+                    [game, author, user, systems, tags, *filter_controls,
+                     filters_block, table, note, count, state, notice, pager,
+                     prev, nxt]).then(None, None, None, js=COLLAPSE_FILTERS)
         inputs = [state, mode, game, author, user, systems, tags,
-                  f_genre, f_system, f_author, f_tags, f_rating, f_count,
-                  f_year_from, f_year_to, per_page]
+                  *filter_controls, per_page]
+        # The dynamic filters ride along on every run so their choices can be
+        # rebuilt when the query changes and left alone when it does not.
+        results_out = [table, note, count, state, notice, pager, prev, nxt,
+                       filters_block, f_author, f_system, f_language, f_topics,
+                       f_year_from, f_year_to, f_rating, f_count]
+        def _recommend_clicked(*args):
+            """The button may say "pick something first"; a filter move may not."""
+            return recommend(*args, announce=True)
+
         # One at a time: two CPUs shared between concurrent requests makes
         # everyone slow, whereas a queue makes the wait visible.
-        go.click(recommend, inputs, [table, note, count, state, pager, prev, nxt], concurrency_limit=1)
+        go.click(_recommend_clicked, inputs, results_out, concurrency_limit=1).then(
+            None, None, None, js=COLLAPSE_FILTERS)
+
+        # Filters now sit below the results and far from the button, so they
+        # apply as they are set rather than waiting for another click. This is
+        # cheap: the scored pool is cached in state, so a filter change
+        # re-filters and re-renders without scoring anything.
+        #
+        # `.change` rather than `.input`, despite change also firing for the
+        # programmatic updates `recommend` itself makes: Gradio's dropdown emits
+        # `input` from its option-select path but not from the branch that
+        # commits a typed custom value, and typed fragments are half of what
+        # these filters are for. The echo is defused in `recommend` instead, by
+        # recognising its own values coming back.
+        for control in filter_controls:
+            control.change(recommend, inputs, results_out, concurrency_limit=1)
+
+        # Restoring the controls is programmatic, so it fires no handlers of its
+        # own; the explicit re-run is what makes the results match them.
+        # Years reset to the ends of what this result set offers, since those
+        # are the values that mean "no year constraint" here; the corpus-wide
+        # defaults would sit outside the dropdowns' own choices.
+        def _reset_filters(state):
+            # Choices travel with every value. Sending a bare number relies on
+            # the dropdown already offering it, and when state and screen had
+            # drifted apart Gradio rejected the update outright — "2026 is not
+            # in the list of choices" — leaving the reader an error toast for a
+            # button that should always work. Sent together they cannot disagree.
+            low, high = (state or {}).get("year_bounds") or (YEAR_MIN, YEAR_MAX)
+            years = list(range(high, low - 1, -1))
+            rungs = (state or {}).get("ladders") or {}
+            rating = rungs.get("rating") or RATING_CHOICES
+            count = rungs.get("count") or RATING_COUNT_CHOICES
+            return (*FILTER_DEFAULTS[:4],
+                    gr.update(choices=years, value=low),
+                    gr.update(choices=years, value=high),
+                    gr.update(choices=rating, value=_clamp_to(rating, FILTER_DEFAULTS[6])),
+                    gr.update(choices=count, value=_clamp_to(count, FILTER_DEFAULTS[7])))
+
+        reset_filters.click(_reset_filters, state, filter_controls).then(
+            recommend, inputs, results_out)
         # Paging lands the reader back at the summary, not stranded at the
         # bottom of the previous page.
         prev.click(lambda s: turn_page(s, -1), state, [table, note, count, state, pager, prev, nxt]).then(

@@ -126,6 +126,93 @@ def drop_non_games(game_docs: pd.DataFrame) -> Tuple[pd.DataFrame, set]:
     return game_docs.loc[~flagged].copy(), excluded
 
 
+# IFDB writes "no authoring system recorded" as the literal string "None" — 164
+# games — and one entry as "N/A". Both are an absence wearing the costume of a
+# value: they sat in the vibe picker and the system filter as though they were
+# something to search for, and rendered on cards as "None" where every other
+# missing field shows an em dash.
+SYSTEM_PLACEHOLDERS = {"none", "n/a", "na", "null", "nan", "unknown"}
+
+
+def strip_placeholder_systems(game_docs: pd.DataFrame) -> pd.DataFrame:
+    """
+    Blank system values that only say "not recorded".
+
+    Rewrites the original and the `_clean` column together, before anything is
+    derived from either: the display map and the system filter are built from
+    the first, the vibe vocabulary from the second, so a value left in one would
+    reappear in half the interface. Entries are dropped per comma-separated
+    part, leaving any real system alongside them intact.
+
+    Deliberately not `drop_non_games`: these are ordinary games that happen to
+    have nothing recorded in one field, and dropping them would hide 164 games
+    to tidy up a dropdown.
+    """
+    def kept(value) -> str:
+        parts = [p.strip() for p in str(value or "").split(",") if p.strip()]
+        return ", ".join(p for p in parts if p.lower() not in SYSTEM_PLACEHOLDERS)
+
+    out = game_docs.copy()
+    for column in ("system", clean_col("system")):
+        if column in out.columns:
+            out[column] = out[column].map(kept)
+    return out
+
+
+# IFDB's language field is free text that has collected ISO codes ("en"),
+# regional variants ("en-US", "zh-Hans"), spelled-out names ("English"),
+# three-letter forms ("rus"), and multi-language entries ("en, fr"). Readers want
+# "English", and filters match what is displayed, so both go through this.
+LANGUAGE_NAMES = {
+    "en": "English", "es": "Spanish", "fr": "French", "de": "German",
+    "it": "Italian", "ru": "Russian", "cs": "Czech", "zh": "Chinese",
+    "ja": "Japanese", "pt": "Portuguese", "sv": "Swedish", "sk": "Slovak",
+    "nl": "Dutch", "hu": "Hungarian", "pl": "Polish", "sr": "Serbian",
+    "sl": "Slovenian", "ca": "Catalan", "ko": "Korean", "da": "Danish",
+    "hr": "Croatian", "eo": "Esperanto", "no": "Norwegian", "uk": "Ukrainian",
+    "tr": "Turkish", "el": "Greek", "ro": "Romanian", "bs": "Bosnian",
+    "ms": "Malay", "bn": "Bengali", "id": "Indonesian", "ar": "Arabic",
+    "iu": "Inuktitut", "fi": "Finnish", "is": "Icelandic",
+    # Spelled-out and three-letter forms that appear in the dump.
+    "english": "English", "danish": "Danish", "rus": "Russian",
+    "cat": "Catalan", "sco": "Scots", "jbo": "Lojban",
+    "tok": "Toki Pona", "toki pona": "Toki Pona",
+}
+
+# Tokens carrying no language information. "mis" and "und" are the ISO codes for
+# "uncoded" and "undetermined", which say nothing a reader can use.
+LANGUAGE_NOISE = {"+", "users choice", "mis", "und", "zxx", "n/a", "none", "nan"}
+
+_PARENTHETICAL = re.compile(r"\([^)]*\)")
+
+
+def clean_language(raw) -> str:
+    """
+    IFDB's language field to displayable names, e.g. "en, fr" -> "English, French".
+
+    Unrecognised tokens are kept rather than dropped — a code this map has not
+    seen is still information, and silently blanking it would hide the game's
+    language rather than admit the map is incomplete. Short unknowns are upper-
+    cased so they read as codes; longer ones are title-cased so "spanglish"
+    arrives as "Spanglish".
+    """
+    names = []
+    text = _PARENTHETICAL.sub(" ", str(raw or ""))
+    for part in re.split(r"[,;/]", text):
+        token = part.strip().lower()
+        if not token or token in LANGUAGE_NOISE:
+            continue
+        base = token.split("-")[0].split("_")[0].strip()
+        if base in LANGUAGE_NOISE:
+            continue
+        name = LANGUAGE_NAMES.get(base) or LANGUAGE_NAMES.get(token)
+        if name is None:
+            name = base.upper() if len(base) <= 3 else base.title()
+        if name not in names:
+            names.append(name)
+    return ", ".join(names)
+
+
 def clean_description(raw) -> str:
     """
     IFDB's HTML description to a single line of plain text.

@@ -48,8 +48,9 @@ from src.pipeline.retriever import Retriever
 from src.data.preprocessor import (
     SYSTEM_GENRE_SEPARATORS, TAG_SEPARATORS,
     build_author_profiles, build_display_map, clean_description, clean_frequencies,
-    drop_non_games, format_display, format_profile_text, author_game_map,
-    parse_profile_text, profile_display,
+    clean_language, drop_non_games, format_display, format_profile_text,
+    strip_placeholder_systems,
+    author_game_map, parse_profile_text, profile_display,
 )
 from src.data.pickers import (
     author_choices, game_choices, reviewer_choices, vocab_choices,
@@ -390,6 +391,14 @@ def load_artefacts(cfg: dict):
     if excluded_games:
         logger.info("Excluded %d entries tagged 'not a game'", len(excluded_games))
 
+    # Before the display maps and vocabularies below are derived from these
+    # columns, so "None" never reaches a picker, a filter or a card.
+    blank_before = int((game_docs["system"].fillna("").astype(str).str.strip() == "").sum())
+    game_docs = strip_placeholder_systems(game_docs)
+    blanked = int((game_docs["system"].str.strip() == "").sum()) - blank_before
+    if blanked:
+        logger.info("Blanked %d placeholder system values", blanked)
+
     # Precompute the display form of each free-text field once, rather than
     # reformatting on every render. System and genre also split on "/", which
     # IFDB uses inconsistently ("Drama / Political").
@@ -410,14 +419,23 @@ def load_artefacts(cfg: dict):
     # once here, rather than on every render.
     games_path = data_dir / "games.parquet"
     if games_path.exists():
-        raw_desc = pd.read_parquet(games_path, columns=["gameid", "desc"])
-        by_id = dict(zip(raw_desc["gameid"], raw_desc["desc"]))
-        game_docs["description"] = [clean_description(by_id.get(g, ""))
+        raw_extra = pd.read_parquet(games_path, columns=["gameid", "desc", "language"])
+        # fillna before the values become strings: a missing cell is a float NaN,
+        # which is truthy, so `str(value or "")` downstream yields the literal
+        # "nan" — which then reads as a language code and displays as "NAN".
+        desc_by_id = dict(zip(raw_extra["gameid"], raw_extra["desc"].fillna("")))
+        lang_by_id = dict(zip(raw_extra["gameid"], raw_extra["language"].fillna("")))
+        game_docs["description"] = [clean_description(desc_by_id.get(g, ""))
                                     for g in game_docs["gameid"]]
-        logger.info("Loaded %d game descriptions", int((game_docs["description"] != "").sum()))
+        game_docs["language"] = [clean_language(lang_by_id.get(g, ""))
+                                 for g in game_docs["gameid"]]
+        logger.info("Loaded %d descriptions, %d languages",
+                    int((game_docs["description"] != "").sum()),
+                    int((game_docs["language"] != "").sum()))
     else:
         game_docs["description"] = ""
-        logger.warning("games.parquet missing — descriptions will be blank")
+        game_docs["language"] = ""
+        logger.warning("games.parquet missing — descriptions and languages will be blank")
 
     user_profiles = pd.read_parquet(data_dir / "user_profiles_retrieval.parquet")
 
@@ -436,7 +454,7 @@ def load_artefacts(cfg: dict):
     # game_docs files written before the clean/original split. Display reads
     # game_docs directly, so it always shows the IFDB originals.
     info_cols = ["author", "author_clean", "system", "system_clean",
-                 "tags", "tags_clean", "genre", "year",
+                 "tags", "tags_clean", "genre", "year", "language",
                  "avg_rating", "bayesian_avg", "review_count"]
     available = [c for c in info_cols if c in game_docs.columns]
     game_info_map: Dict[str, dict] = (

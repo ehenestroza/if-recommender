@@ -139,12 +139,83 @@ Filters narrow a ranking you are already looking at. They run after scoring, so 
 | Key | Matches |
 |---|---|
 | `year` | publication year, inclusive |
-| `author`, `system`, `genre` | any listed term (OR within the field) |
-| `tags` | every listed tag must match (AND) |
+| `author`, `system`, `language`, `genre_tags` | any listed term (OR within the field) |
 | `rating` | raw community average; unrated games excluded |
 | `count` | number of ratings |
 
-Two decisions worth knowing:
+Every filter offers only what the results in front of you contain: the list
+fields are ordered by frequency, the year dropdowns span that set's own range
+(continuously, gaps filled), and the two rating ladders are trimmed to the rungs
+that change something — a rung above everything observed returns nothing, and a
+rung below the lowest returns what the next one up already returns. Counts of
+2, 3, 8, 10, 12 leave `[2, 5, 10]` out of `[0, 1, 2, 5, 10, 25, 50]`.
+
+IFDB records "no authoring system" as the literal string `None` (164 games) and
+once as `N/A`. Both are blanked at load time, in the original and `_clean`
+columns together, before the display maps and vocabularies are derived from
+them — otherwise the absence appears as something to search for in the vibe
+picker and the system filter, and prints as "None" on a card where every other
+missing field shows an em dash. The `N/A` was worse than it looked: the display
+map splits on `/`, so it had also been producing systems called "N" and "A". The
+games themselves stay; only the field is emptied. `Other` and `Misc` in the
+genre and tag lists are left alone — vague, but real values people applied.
+
+Messages — "pick a game first", "no results match those filters" — render in
+their own slab below the filters rather than in the profile block. Folding the
+no-match message into the profile replaced it, taking away the one thing that
+says what there is to relax. Only a press of the recommend button may prompt for
+missing input: the same function runs whenever a filter moves, including the
+moves it makes itself when a mode changes, and a prompt appearing then answers a
+question nobody asked.
+
+The four numeric filters accept values outside their own choices. Gradio rejects
+an incoming value the component no longer lists, and these lists are rewritten on
+every query, so a control still reporting the previous render's year failed
+validation before any of this code ran — an error toast for a query that had
+worked. Values are coerced where they are read instead.
+
+Every control resets on a new query and the block reappears collapsed, so no
+setting outlives the search it was made against. Switching mode does the same
+immediately rather than waiting for the button, and clears the results with it:
+the block's choices were built from the previous mode's results and its values
+were applied to them, so both describe something the reader has just navigated
+away from.
+
+Two traps live in that, both of which cost results silently rather than
+visibly. **The rating ladders are derived from the scored pool, not from the
+results on screen.** The results on screen have always had the rating filter
+applied to them, so rungs read back off them would start at the 3.0 default —
+the filter could only ever be tightened, and the tail below it would be
+unreachable. The pool is that same set before the two thresholds touched it.
+Defaults are snapped into the rungs *before* filtering rather than after, since
+a pool whose games all hold 19 ratings offers only the rung below that. **And a
+year span counts as "no constraint" only against the span being offered**, not
+the corpus one, because applying a range drops the 184 games with no recorded
+year.
+
+Genre and tags are one filter, `genres/tags`, matching either field. The
+matching has always pooled them — the `_clean` tag column folds genre in, which
+is what the encoders were trained on — so presenting two filters implied a
+distinction the data does not keep: "Fantasy" is a genre on one game and a tag
+on the next. The dropdown merges both fields' values, deduped case-insensitively and ordered
+by how many results carry each. Spelling is fixed corpus-wide by deferring to
+the tag column, not by picking the commoner of the two forms: "Horror" outnumbers
+"horror" (938 games to 806) while "comedy" beats "Comedy" (196 to 73), so
+frequency alone sets a capitalised word beside a lowercase one and the list still
+looks unedited. Deferring to tags holds one convention — the same one the vibe
+picker shows, so a value reads identically in both.
+It offers the raw values, so competition tags (IFComp, XYZZY) are filterable
+even though the vibe picker's cleaned vocabulary drops them. Cards still show
+genre and tags on separate rows, which is where the distinction earns its place.
+
+Every list-valued field is OR within itself and AND against the others, which is
+the faceted-search convention. `tags` was the exception until the filter lists
+started being built from the result set: with dynamic choices, OR also means a
+combination the UI offers can never come back empty. The cost is that requiring
+two tags at once is no longer expressible — narrowing now comes from combining
+*different* facets rather than stacking one.
+
+Two more decisions worth knowing:
 
 **Filters match the original IFDB values, not the `_clean` ones**, so a filter only ever matches something visible in the results. `tags:IFComp 2025` works, even though competition tags are stripped from `tags_clean`. And `tags:slice of life` no longer returns games that merely have *genre* "Slice of life" — that used to look like false positives, since genre isn't shown in the tags column.
 

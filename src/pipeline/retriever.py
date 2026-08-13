@@ -136,6 +136,8 @@ def apply_hard_filters(
     system: Optional[str] = None,
     tags: Optional[str] = None,
     genre: Optional[str] = None,
+    genre_tags: Optional[str] = None,
+    language: Optional[str] = None,
     min_rating: Optional[float] = None,
     min_rating_count: Optional[int] = None,
 ) -> List[Tuple[str, float]]:
@@ -146,11 +148,21 @@ def apply_hard_filters(
     author:           term(s) substring-matched against any individual author name
     system:           term(s) substring-matched against any individual system name
     genre:            term(s) substring-matched against the game's genre values
-    tags:             every listed tag must substring-match one of the game's tags
+    language:         term(s) substring-matched against the game's languages,
+                      which are stored already normalised to display names —
+                      IFDB's raw field is ISO codes, and nobody filters for "en"
+    tags:             term(s) substring-matched against the game's tags
+    genre_tags:       term(s) matched against genre *or* tags, for callers that
+                      present the two as one field. IFDB splits the same idea
+                      across both — "Fantasy" is a genre on one game and a tag
+                      on the next — so a reader picking "fantasy" means either
 
-    author, system and genre accept a list and match if ANY term hits; tags
-    require ALL. A game has one system, so listing two means "either", whereas
-    listing two tags means "both".
+    Every list-valued filter matches if ANY term hits, which is the faceted-
+    search convention: selections within one facet widen, and separate facets
+    narrow. Tags required ALL until it became the only facet behaving
+    differently — and with the filter lists now built from the result set,
+    "any" also guarantees that a combination the UI offers can never return
+    nothing.
     min_rating:       lower bound on the game's raw community average rating;
                       also excludes unrated games, whose average is only the prior
     min_rating_count: lower bound on the number of ratings the game has received
@@ -169,8 +181,8 @@ def apply_hard_filters(
     Substring matching keeps it forgiving: "inform" matches "Inform 7", "horror"
     matches "cosmic horror".
     """
-    if not any([year_range, author, system, tags, genre,
-                min_rating is not None, min_rating_count is not None]):
+    if not any([year_range, author, system, tags, genre, language,
+                genre_tags, min_rating is not None, min_rating_count is not None]):
         return candidates
 
     year_lo: Optional[int] = None
@@ -186,8 +198,13 @@ def apply_hard_filters(
     author_q = _query_terms(author)
     system_q = _query_terms(system)
     genre_q = _query_terms(genre)
+    language_q = _query_terms(language)
     tag_queries: set = (
         {t.strip().lower() for t in tags.split(",") if t.strip()} if tags else set()
+    )
+    genre_tag_queries: set = (
+        {t.strip().lower() for t in genre_tags.split(",") if t.strip()}
+        if genre_tags else set()
     )
 
     filtered: List[Tuple[str, float]] = []
@@ -207,7 +224,7 @@ def apply_hard_filters(
             if year_hi is not None and year > year_hi:
                 continue
 
-        # Any of the listed terms may match (OR); tags below require all (AND).
+        # Any of the listed terms may match (OR), tags included.
         if author_q:
             if not any(q in a for q in author_q for a in _original_values(info, "author")):
                 continue
@@ -220,9 +237,18 @@ def apply_hard_filters(
             if not any(q in g for q in genre_q for g in _original_values(info, "genre")):
                 continue
 
+        if language_q:
+            if not any(q in l for q in language_q for l in _original_values(info, "language")):
+                continue
+
         if tag_queries:
             game_tags = _original_values(info, "tags")
-            if not all(any(q in t for t in game_tags) for q in tag_queries):
+            if not any(q in t for q in tag_queries for t in game_tags):
+                continue
+
+        if genre_tag_queries:
+            both = _original_values(info, "genre") | _original_values(info, "tags")
+            if not any(q in v for q in genre_tag_queries for v in both):
                 continue
 
         if min_rating is not None:

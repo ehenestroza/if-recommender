@@ -17,7 +17,7 @@ Pick a game you like, an author you click with, a reviewer whose taste you trust
 
 All four work the same way underneath: your choice becomes a short profile like `twine, ink // mystery, surreal, multiple endings`, and games are ranked by relevance, or how well they match that profile.
 
-Results can then be narrowed by genre, system, author, tags, rating, review count and year. Filters accept typed fragments, so `xyzzy` matches every XYZZY tag and `inform` matches every version of Inform.
+Results can then be narrowed by author, system, language, genres/tags, year, rating and review count. Each filter offers only the values present in the results you're looking at, ordered by how often they appear. Filters accept typed fragments, so `xyzzy` matches every XYZZY tag and `inform` matches every version of Inform.
 
 Two filters start switched on: rating ≥ 3.0 and at least one rating. You can turn those knobs down to tap into more obscure games, or up to get safer picks that are universally well-regarded.
 
