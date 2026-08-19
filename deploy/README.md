@@ -177,7 +177,7 @@ tail -f /var/log/cloud-init-output.log     # provisioning
 journalctl -u if-recommender -f            # the app itself
 ```
 
-The app is up when the log shows Gradio listening on `127.0.0.1:7860`.
+The app is up when the log shows Gradio listening on `127.0.0.1:7860`. That line is a `print()` rather than a log call, so it only appears because the service sets `PYTHONUNBUFFERED=1`; on an instance provisioned before that was added, expect the log to go quiet after the last INFO line and check with `curl -sI http://localhost/` instead. Silence there means running, not stuck.
 
 ## Verify the boot before touching DNS
 
@@ -240,9 +240,10 @@ sudo systemctl start if-recommender
 Not automated, because it needs a domain name pointed at the instance first. Once you have one:
 
 ```bash
-sudo apt install certbot python3-certbot-nginx
 sudo certbot --nginx -d your-domain.example
 ```
+
+Cloud-init already installs certbot from snap and links it onto the path, so there is nothing to install first — and `apt install certbot` would put a second, older copy alongside it.
 
 Add port 443 to the **security list** first — that is the VCN setting, same as port 80 above. The instance-side iptables rule for 443 is already opened by cloud-init, so there is nothing to run for it.
 

@@ -79,6 +79,12 @@ write_files:
       WorkingDirectory=/opt/if-recommender
       Environment=HOME=/home/ubuntu
       EnvironmentFile=/etc/if-recommender-runtime.env
+      # Without this, stdout is block-buffered because journald is a pipe rather
+      # than a terminal, and Gradio's "Running on local URL" — a print(), not a
+      # log call — sits in the buffer for the life of the process. The app is
+      # serving normally and the one line that says so never arrives, while
+      # logging output does, because stderr is line-buffered either way.
+      Environment=PYTHONUNBUFFERED=1
       ExecStart=/usr/local/bin/uv run --frozen python app.py
       Restart=always
       RestartSec=10
