@@ -338,6 +338,17 @@ Every interval spans zero and the point estimates fall on both sides of it — t
 | fbgemm | deployment VM (x86, 2 vCPU) | 45 → 92 | **2.02×** |
 | qnnpack | Apple M-series laptop | 149 → 36 | **0.24×** |
 
+Selecting the backend is the part that bit. `torch.backends.quantized.supported_engines`
+lists what the wheel was compiled with, not what the CPU can execute, and the
+two diverge on exactly the host this deploys to: the Linux aarch64 wheel
+advertises `fbgemm`, so choosing from that list alone force-set an x86 backend
+on an Ampere A1 and the first `linear_prepack` raised `RuntimeError: unknown
+architecure`, exiting the service on every restart. macOS arm64 advertises only
+`qnnpack`, which is why development never reproduced it. The engine is now
+gated on `platform.machine()`, and `apply` catches anything the backend throws
+and continues in fp32 — this is a speed optimization on a model that is correct
+without it, so it may cost latency but never availability.
+
 Hence `model.quantize_reranker: "auto"`, which consults the backend rather than trusting a boolean: it enables quantization on fbgemm and skips it on qnnpack, so one config.yaml is correct on an E-series instance and on an Ampere A1. Quantized kernels are also CPU-only, so it skips (loudly) when the model has landed on MPS or CUDA.
 
 One trap is worth recording, because it fails silently. `CrossEncoder.model` is a property proxying to `ce[0].auto_model`, and `nn.Module.__setattr__` intercepts Module assignments before the property setter runs — so assigning to either registers an unused second child and leaves the module `forward()` calls in fp32. Inference keeps working and returns *bit-identical* scores, which reads as "quantization changed nothing" rather than as a bug. The correct target is `ce[0].model`, and `src/pipeline/quantize.py` asserts the live module converted so it cannot recur.

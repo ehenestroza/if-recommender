@@ -15,7 +15,140 @@ Measured with [`scripts/measure_memory.py`](../scripts/measure_memory.py) — ~1
 
 Either architecture *runs*, but prefer **x86_64**. The cross-encoder is dynamically quantized to int8 where it pays off, and that depends on the backend: fbgemm (x86) measured **2.02×**, while ARM's qnnpack measured *slower* and is skipped. `model.quantize_reranker: "auto"` picks correctly on both, so an A1 instance is correct — just roughly half the live throughput on `vibe`.
 
+The backend is chosen from `platform.machine()`, not from `torch.backends.quantized.supported_engines`, which reports what the wheel was *built* with rather than what the CPU can run. The Linux aarch64 wheel lists `fbgemm`; selecting it on an A1 made the first prepack raise `RuntimeError: unknown architecure` and the service exited 1 on every restart. macOS arm64 lists only `qnnpack`, so development never saw it.
+
 Both architectures are otherwise fine: torch, faiss-cpu and numpy all publish `manylinux` wheels for `aarch64`, so nothing gets built from source.
+
+The Always Free allocation is Ampere A1 only — the free x86 shapes are `VM.Standard.E2.1.Micro`, 1 GB of RAM, which cannot hold the models. So a free-tier deployment gives up the fbgemm path deliberately, and the compensation is that the same allocation affords twice the cores. See [Launching a free-tier instance](#launching-a-free-tier-instance).
+
+## Launching a free-tier instance
+
+A1 capacity is usually exhausted in popular regions, so the launch is a retry loop rather than a single command. Run it in Cloud Shell, which already has the CLI authenticated as you.
+
+Always Free covers **2 OCPUs and 12 GB of A1 total** in your home region, and 200 GB of block storage across at most two volumes. That is the entire allocation, so the shape config below asks for exactly it.
+
+Budget for `vibe` being noticeably slower than it is on the paid x86 box, from two compounding losses: half the cores, and the int8 path skipped because it does not pay off on ARM (`quantize_reranker: "auto"` detects that, so nothing needs configuring). Re-measure once it is up — `scripts/measure_latency.py --json`, per [Operating it](#operating-it) — and if the tail is worse than you want to serve, `rerank_pool_cap` in `config.yaml` is the control: it bounds how many candidates the cross-encoder scores, so halving it roughly halves the worst case.
+
+Collect the OCIDs first. They are exported because the loop below runs as a separate process and would not otherwise see them — under `set -u` that surfaces as `C: unbound variable` on the first line, which reads like a shell problem rather than a missing export.
+
+```bash
+export C=$OCI_TENANCY        # Cloud Shell presets this to the tenancy root
+
+# Filtering by --shape returns only images that boot on A1, which is what stops
+# an x86 OCID carried over from the old instance reaching an ARM shape.
+export IMAGE=$(oci compute image list --compartment-id "$C" \
+  --operating-system "Canonical Ubuntu" --operating-system-version "24.04" \
+  --shape VM.Standard.A1.Flex \
+  --query 'data[0].id' --raw-output)
+
+# The *public* subnet, which is not reliably the first one.
+export SUBNET=$(oci network subnet list --compartment-id "$C" \
+  --query 'data[?"prohibit-public-ip-on-vnic"==`false`] | [0].id' --raw-output)
+
+# Everything on offer, and which of them that picked.
+oci network subnet list --compartment-id "$C" \
+  --query 'data[].{name:"display-name",id:id,private:"prohibit-public-ip-on-vnic"}' \
+  --output table
+echo "picked: ${SUBNET:-NONE}"
+```
+
+A VCN made by the console wizard contains both a public and a private subnet, and the private one is often listed first — so `data[0].id` selects the subnet that cannot carry `--assign-public-ip true`, and the instance either fails to launch or comes up unreachable. `prohibit-public-ip-on-vnic` is the field that decides it, and `false` means public: it is the same property the launch flag needs, rather than a guess from the name, which is only a label and can say anything.
+
+If `picked:` prints `NONE`, this compartment has no public subnet and one has to be created before launching — the loop would otherwise fail on every attempt with an error that says nothing about subnets.
+
+Then write the loop to a file and run it — pasting it straight into the shell would take an `exit` with it, and a file can be re-run unchanged after Cloud Shell disconnects:
+
+```bash
+cat > launch.sh <<'EOF'
+#!/usr/bin/env bash
+set -u
+NAME=if-recs
+KEY=$HOME/.ssh/if-recs.pub        # the public half of the key you will connect with
+
+# Fetched, never uploaded — see "Verify the boot" below for why.
+curl -fsSL -o cloud-init.yaml \
+  https://raw.githubusercontent.com/ehenestroza/if-recommender/main/deploy/cloud-init.yaml
+
+ADS=$(oci iam availability-domain list --compartment-id "$C" | jq -r '.data[].name')
+
+DELAY=60           # between sweeps of every AD
+MAX_DELAY=900      # ceiling, used only when OCI says we are asking too often
+wait=$DELAY
+
+while :; do
+  # Re-runnable and disconnect-proof: never launch a second instance, which
+  # would put the account over the free allocation and start billing.
+  # `.data[]?` and the default cover the first run: with nothing matching, the
+  # CLI prints nothing at all, jq then yields nothing, and an empty string is a
+  # syntax error to `-gt` — failing on the one path that is entirely normal.
+  live=$(oci compute instance list --compartment-id "$C" --display-name "$NAME" 2>/dev/null \
+         | jq '[.data[]? | select(."lifecycle-state"
+                | test("RUNNING|PROVISIONING|STARTING"))] | length' 2>/dev/null || true)
+  if [ "${live:-0}" -gt 0 ]; then echo "$NAME already exists — nothing to do."; break; fi
+
+  for AD in $ADS; do
+    echo "$(date '+%H:%M:%S') trying $AD"
+    if oci compute instance launch \
+        --availability-domain "$AD" \
+        --compartment-id "$C" \
+        --display-name "$NAME" \
+        --shape VM.Standard.A1.Flex \
+        --shape-config '{"ocpus":2,"memoryInGBs":12}' \
+        --image-id "$IMAGE" \
+        --subnet-id "$SUBNET" \
+        --assign-public-ip true \
+        --boot-volume-size-in-gbs 100 \
+        --ssh-authorized-keys-file "$KEY" \
+        --user-data-file cloud-init.yaml \
+        --wait-for-state RUNNING 2>launch.err
+    then
+      echo "LAUNCHED in $AD"; exit 0
+    fi
+    # The CLI reports a ServiceError as a JSON blob whose useful half — the
+    # message — sits past character 200, behind the SDK version string and the
+    # logging tips. Pull out the code and the message; anything that is not
+    # JSON (a usage error, say) falls back to the head of the raw text.
+    raw=$(tr '\n' ' ' < launch.err)
+    err=$(sed 's/^[^{]*//' <<<"$raw" \
+          | jq -r 'select(.code) | "\(.code): \(.message // "?")"' 2>/dev/null)
+    [ -n "$err" ] || err=$(cut -c1-200 <<<"$raw")
+    echo "$(date '+%H:%M:%S') $AD: $err"
+
+    # Classified on the whole error, never on the line printed above: truncate
+    # first and "Out of host capacity" is cut away before it can be matched,
+    # leaving the loop to run on `InternalError` alone — which it happens to
+    # survive, until a capacity error arrives carrying some other code.
+    case "$raw" in
+      *"Out of host capacity"*|*InternalError*|*"Internal Server Error"*)
+        wait=$DELAY ;;                      # keep asking at a steady rate
+      *TooManyRequests*|*"429"*)            # asking too often *is* the problem,
+        wait=$(( wait * 2 ))                # so retrying at the same rate is
+        [ "$wait" -gt "$MAX_DELAY" ] && wait=$MAX_DELAY
+        echo "throttled — backing off to ${wait}s" ;;
+      *) echo "not a capacity error, stopping:"; cat launch.err; exit 1 ;;
+    esac
+  done
+  # Jittered, so a fleet of loops all polling on the minute do not converge on
+  # the same instant — including whatever else is chasing the same capacity.
+  nap=$(( wait + RANDOM % 15 ))
+  echo "$(date '+%H:%M:%S') nothing free in any AD, next sweep in ${nap}s"
+  sleep "$nap"
+done
+EOF
+bash launch.sh 2>&1 | tee -a launch.log
+```
+
+**On the interval.** A sweep tries every AD, so the rate is one launch call per AD per `DELAY` — three ADs at 60s is three calls a minute, not one. 60s is a sensible floor. Capacity, when it appears, is usually taken within seconds by everyone else polling for it, so the odds are governed far more by happening to be mid-sweep than by shaving the interval, while each halving multiplies the request rate against a limit Oracle does not publish a figure for. Below about 30s there is little left to win.
+
+The interval no longer has to be picked conservatively as insurance, because the loop distinguishes the two failures rather than lumping them together: out-of-capacity holds the steady rate, while a 429 doubles the wait up to fifteen minutes and then relaxes once capacity errors resume. That is the one case where retrying at an unchanged cadence is precisely wrong, since the request rate *is* the complaint.
+
+Since every attempt's error is logged, the question is also answerable from evidence rather than from documentation — `grep -c TooManyRequests launch.log` says whether this tenancy minds the current cadence. If it never appears, the rate is fine.
+
+One caveat worth checking before going faster: the CLI retries some 5xx responses internally, which would make a single loop attempt several API calls and quietly multiply the rate. `oci --help` lists the global retry options; pinning `--max-retries 0` on the launch call makes the loop's interval mean what it says.
+
+Cloud Shell ends with the browser tab, so expect to restart the loop; the existence check at the top makes that safe.
+
+`RUNNING` means the hypervisor started the VM, not that the app is up — cloud-init still has ten to twenty minutes of work ahead of it. Carry on with [First boot takes a while](#first-boot-takes-a-while), then the boot checks, and note that the new instance gets a new public IP: update the A record and re-issue the certificate before cutting over.
 
 ## Two things cloud-init cannot do
 

@@ -18,6 +18,7 @@ turn a 2x speedup into a 4x slowdown.
 """
 
 import logging
+import platform
 from typing import Optional, Union
 
 import torch
@@ -28,6 +29,15 @@ logger = logging.getLogger(__name__)
 # qnnpack is its ARM counterpart. Preference order matters on hosts shipping
 # both, because fbgemm is substantially better optimised for this shape.
 _ENGINE_PREFERENCE = ("fbgemm", "qnnpack")
+
+# Machines fbgemm can actually run on. `supported_engines` reports what the
+# wheel was *built* with, not what this CPU can execute, and the two differ on
+# exactly the host we deploy to: the Linux aarch64 wheel lists fbgemm, so
+# selecting by that list alone force-set an x86 backend on an Ampere A1 and the
+# first prepack died with "RuntimeError: unknown architecure" — taking the
+# service down at startup rather than merely running slowly. macOS arm64 lists
+# only qnnpack, which is why this never showed up in development.
+_X86_MACHINES = frozenset({"x86_64", "amd64", "x86", "i386", "i686"})
 
 # Backends where dynamic quantization is known to pay off. "auto" enables
 # quantization only here; everywhere else it is skipped rather than guessed at.
@@ -42,12 +52,15 @@ def select_engine() -> Optional[str]:
     an unset engine fails at the first prepack with a bare "NoQEngine" — so this
     sets it explicitly rather than relying on a default.
     """
+    machine = platform.machine().lower()
+    preference = _ENGINE_PREFERENCE if machine in _X86_MACHINES else ("qnnpack",)
     supported = list(torch.backends.quantized.supported_engines)
-    for engine in _ENGINE_PREFERENCE:
+    for engine in preference:
         if engine in supported:
             torch.backends.quantized.engine = engine
             return engine
-    logger.warning("No quantized backend available (supported: %s)", supported)
+    logger.warning("No quantized backend available for %s (build supports: %s)",
+                   machine, supported)
     return None
 
 
@@ -103,6 +116,23 @@ def quantize_cross_encoder(cross_encoder) -> bool:
     return True
 
 
+def _try(cross_encoder) -> bool:
+    """
+    Quantize, or log loudly and carry on in fp32.
+
+    Nothing here is worth an outage. This is a speed optimization on a model
+    that runs correctly without it, so a backend that turns out to be unusable
+    should cost latency, not availability — which is exactly what it cost when
+    an x86 backend was selected on ARM and the process exited 1 on every
+    restart. The traceback still reaches the log; only the crash is removed.
+    """
+    try:
+        return quantize_cross_encoder(cross_encoder)
+    except Exception:
+        logger.exception("int8 quantization failed — continuing in fp32")
+        return False
+
+
 def apply(cross_encoder, setting: Union[bool, str]) -> bool:
     """
     Honour a config value of True, False or "auto". Returns True if quantized.
@@ -117,7 +147,7 @@ def apply(cross_encoder, setting: Union[bool, str]) -> bool:
         return False
 
     if setting is True:
-        return quantize_cross_encoder(cross_encoder)
+        return _try(cross_encoder)
 
     if str(setting).lower() != "auto":
         raise ValueError(
@@ -132,4 +162,4 @@ def apply(cross_encoder, setting: Union[bool, str]) -> bool:
             engine or "none",
         )
         return False
-    return quantize_cross_encoder(cross_encoder)
+    return _try(cross_encoder)
