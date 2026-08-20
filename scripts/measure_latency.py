@@ -141,7 +141,11 @@ def main() -> None:
         raw_n = len(candidates)
         _, query_tags = parse_profile_text(query_text)
         if retr.get("prefilter_by_tag", True) and query_tags:
-            candidates = filter_by_tag_overlap(candidates, game_info_map, set(query_tags))
+            candidates = filter_by_tag_overlap(
+                candidates, game_info_map, set(query_tags),
+                min_matches=retr.get("prefilter_tag_matches", 1),
+                min_matches_from=retr.get("prefilter_tag_matches_from"),
+            )
 
         # Same order as both front-ends: cap after the tag pre-filter, so the cap
         # spends its budget on candidates that survived it.

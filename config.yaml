@@ -60,8 +60,21 @@ retrieval:
   # Precomputed modes ignore it. 1000 is a tail control: it leaves the median
   # query untouched and clips the worst case, at zero measured quality cost
   # (ΔNDCG@10 = 0.0000, 0.992 page overlap over 300 users).
-  rerank_pool_cap: 1000
+  # 500, not the 1,000 the cap experiment settled on: that was chosen against an
+  # x86 host where the tail cost 11.7s, and an A1 core scores 19 pairs/s where
+  # the old box managed 91.5. The tag policy above already handles queries
+  # offering three or more tags, so what remains under this cap is the one- and
+  # two-tag queries it cannot reach — which is where the 0.854 overlap@25 that
+  # 500 costs is now actually spent, rather than across every query.
+  rerank_pool_cap: 500
   prefilter_by_tag: true      # drop candidates sharing no tag with the query (measured free)
+  # Ask for two shared tags once the query offers three or more. Measured over
+  # 300 held-out users: 72% fewer pairs scored at 0.86 overlap@25 with the
+  # unfiltered page, and NDCG@10 unmoved — a better trade than any cap, because
+  # it prunes on the tags the query is made of rather than on cosine rank.
+  # Live paths only; precompute has no latency budget to protect.
+  prefilter_tag_matches: 2
+  prefilter_tag_matches_from: 3
   index_type: "flat"          # "hnsw" for faster approximate search at scale
   hnsw_m: 32
   use_rating_reranking: true  # blend normalised bayesian_avg into rerank score

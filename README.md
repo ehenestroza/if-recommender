@@ -89,7 +89,7 @@ Everything tunable lives in `config.yaml`. The settings worth knowing:
 |---|---|---|
 | `min_retrieval_score` | 0.25 | How similar a game must be to make the shortlist |
 | `min_rerank_score` | 0.10 | Relevance floor for what gets stored and shown |
-| `rerank_pool_cap` | 1000 | Most candidates scored live, per `vibe` query |
+| `rerank_pool_cap` | 500 | Most candidates scored live, per `vibe` query |
 | `rating_weight` | 0.5 | How much rating counts toward *selecting* candidates — never toward their displayed order |
 | `use_diversity` | true | Caps repeat authors and covers your top systems |
 | `top_k_rerank` | 25 | Results per page in the terminal app |

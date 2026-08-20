@@ -26,6 +26,7 @@ import yaml
 
 from src.data.preprocessor import (
     AUTHOR_SEPARATORS,
+    canonical_vibe,
     parse_profile_text,
     SYSTEM_GENRE_SEPARATORS,
     build_author_profiles,
@@ -416,6 +417,7 @@ RETR = CFG["retrieval"]
     GAME_QUERY_TEXT_MAP, GAME_INFO_MAP,
     PRE_USER, PRE_GAME, PRE_AUTHOR,
     AUTHOR_PROFILE_MAP, AUTHOR_NAME_MAP, AUTHOR_GAMES,
+    PRE_VIBE,
 ) = pipeline.load_artefacts(CFG)
 
 META = GAME_DOCS.set_index("gameid")
@@ -466,6 +468,11 @@ GAME_CHOICES = game_choices(GAME_DOCS)
 AUTHOR_CHOICES = author_choices(AUTHOR_PROFILES)
 USER_CHOICES = reviewer_choices(PROFILE_MAP, USER_NAME_MAP, REVIEWS_DF)
 SYSTEM_CHOICES, TAG_CHOICES = vocab_choices(GAME_DOCS)
+# Frequency rank of every pickable value, for putting a vibe pick in a fixed
+# order. The picker lists are already ordered that way, so this is just their
+# index — no second definition of "commonest" to drift from the first.
+SYSTEM_RANK = {value: i for i, (_label, value) in enumerate(SYSTEM_CHOICES)}
+TAG_RANK = {value: i for i, (_label, value) in enumerate(TAG_CHOICES)}
 (GENRE_FILTER_CHOICES, SYSTEM_FILTER_CHOICES, AUTHOR_FILTER_CHOICES,
  TAG_FILTER_CHOICES, YEAR_CHOICES) = _filter_choices()
 YEAR_MAX, YEAR_MIN = YEAR_CHOICES[0], YEAR_CHOICES[-1]
@@ -525,7 +532,11 @@ def _rank(query_text, emb, exclude, cached):
         from src.pipeline.retriever import filter_by_tag_overlap
         _, query_tags = parse_profile_text(query_text)
         if query_tags:
-            candidates = filter_by_tag_overlap(candidates, GAME_INFO_MAP, set(query_tags))
+            candidates = filter_by_tag_overlap(
+                candidates, GAME_INFO_MAP, set(query_tags),
+                min_matches=RETR.get("prefilter_tag_matches", 1),
+                min_matches_from=RETR.get("prefilter_tag_matches_from"),
+            )
     n_filtered = len(candidates)
 
     cap = RETR.get("rerank_pool_cap", 0)
@@ -570,7 +581,24 @@ def _score_browse(systems, tags):
     Arguments are tuples so they hash; the returned lists are never mutated
     downstream (`select_results` builds new ones), so sharing them is safe.
     """
-    query_text = format_profile_text(list(systems), list(tags))
+    systems, tags = canonical_vibe(systems, tags, SYSTEM_RANK, TAG_RANK)
+    query_text = format_profile_text(systems, tags)
+
+    # A precomputed page, if this pick is one of the common ones. Same deal as
+    # the other three modes: an offline job has no latency budget, so these were
+    # scored over the whole pool with no cap, and a hit is both instant and
+    # deeper than the live path would have managed.
+    stored = PRE_VIBE.get(query_text)
+    if stored is not None:
+        # Logged so coverage is measurable rather than assumed: `_rank` prints a
+        # line on every live scoring, so counting the two in the journal gives
+        # the real hit rate for the picks people actually make — which is the
+        # only way to size the table properly, corpus frequency being a poor
+        # stand-in for what someone chooses off a menu.
+        logger.info("Precomputed vibe: %s (%d stored)", query_text, len(stored[0]))
+        gids, scores, rels = stored
+        return list(zip(gids, scores)), dict(zip(gids, rels))
+
     emb = QUERY_ENCODER.encode([query_text], normalize_embeddings=True)[0]
     return _rank(query_text, emb, set(), None)
 
@@ -1024,7 +1052,8 @@ def recommend(state, mode, game, author, user, systems, tags,
     else:  # vibe
         if not systems and not tags:
             return nothing(MODE_PROMPTS["vibe"])
-        query_text = format_profile_text(list(systems or []), list(tags or []))
+        query_text = format_profile_text(
+            *canonical_vibe(systems or [], tags or [], SYSTEM_RANK, TAG_RANK))
         emb = QUERY_ENCODER.encode([query_text], normalize_embeddings=True)[0]
         note = "games matching this vibe"
 

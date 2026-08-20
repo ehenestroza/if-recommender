@@ -108,7 +108,7 @@ Two properties are deliberate:
 
 *The rating term is deliberately the weaker one.* Bayesian smoothing squeezes ratings into roughly 0.54–0.81 while relevance spans nearly 0–1, so rating moves the score about 3× less than its weight implies. That imbalance is load-bearing — see [the blend experiment](#the-rating-blend).
 
-**Deep reranking, capped at the tail.** The reranker scores every candidate above the retrieval threshold up to `rerank_pool_cap` (1,000), applied after the tag pre-filter. Cosine rank and cross-encoder rank correlate only weakly (Spearman ρ ≈ 0.22), so truncating aggressively discards most of what the reranker would have picked — but a median vibe pool is 580 candidates, so the cap binds only on the long tail and leaves the typical query scored end to end. See [the cap experiment](#where-the-cap-belongs-and-what-it-costs) for what it costs, which is nothing measurable.
+**Deep reranking, capped at the tail.** The reranker scores every candidate above the retrieval threshold up to `rerank_pool_cap` (500 since the move to ARM; 1,000 on x86), applied after the tag pre-filter. Cosine rank and cross-encoder rank correlate only weakly (Spearman ρ ≈ 0.22), so truncating aggressively discards most of what the reranker would have picked — but a median vibe pool is 580 candidates, so the cap binds only on the long tail and leaves the typical query scored end to end. See [the cap experiment](#where-the-cap-belongs-and-what-it-costs) for what it costs, which is nothing measurable.
 
 The bi-encoder is doing the pruning either way: a threshold rather than a top-K, but it still takes 10,087 games down to a median of 927 before the cross-encoder sees anything.
 
@@ -315,6 +315,116 @@ Going lower does buy real time (500 puts every query under 12.5 s), but 0.854 ov
 
 The cap is applied **after** the tag pre-filter in both front-ends. At the same K that dominates capping the raw cosine list: it spends the budget on candidates that survived the filter, and measured better at every cap (0.854 vs 0.750 overlap@25 at 500).
 
+### Precomputing the common vibe picks
+
+`vibe` was the only mode still scored at request time, which is why it was the
+only one the move to ARM made slower — the other three have been table lookups
+since `07_precompute.py` existed. It now has a table too: `precomputed_vibe.
+parquet`, 1,050 keys over the top 5 systems paired with each of the top 20 tags
+and each unordered pair of them, 337k rows, 6 MB, 18 minutes to build.
+
+Deliberately one and two tags, which is the inverse of where the work is. Picks
+of three or more tags are already cheap because `prefilter_tag_matches` requires
+two matches of them; it is the one- and two-tag picks that neither that policy
+nor the cap can help, and both of the slowest queries measured on the A1 were of
+that shape. Both are now lookups.
+
+A hit is also *better* than the live path, not merely faster: the offline job has
+no latency budget, so it scores the whole pool uncapped, where a live query would
+have stopped at `rerank_pool_cap` and paid 0.854 overlap@25 for it.
+
+**Click order had to be collapsed first.** A multiselect reports values in the
+order they were clicked, that order reaches the encoder as text, and
+"Tags: horror, romance" against "Tags: romance, horror" returned pages differing
+by 4-12% of their entries — two people wanting the same thing getting different
+answers, and a table that would have had to store both spellings to catch
+either. `canonical_vibe` orders picks by corpus frequency, which is both what
+the pickers display and how the profiles the encoder trained on were built, so a
+canonical query stays in the distribution the model saw.
+
+**Coverage is the weak part, and it is not close to complete.** The top 5
+systems carry 62.7% of all system assignments but the top 20 tags only 25.7% of
+tag assignments, the tail being 5,237 tags long. If picks followed corpus
+frequency a one-tag query would hit about 16% of the time and a two-tag query
+about 4%. Corpus frequency is a poor stand-in for what someone picks off a menu
+— the pickers list options in that same order, so real picks concentrate at the
+top far harder than the corpus does — but the honest position is that the true
+hit rate is unknown.
+
+Widening has sharply diminishing returns, because the tag tail is long:
+
+| systems x tags | keys | build | 1-tag hit (corpus proxy) |
+|---|---|---|---|
+| 5 x 20 (shipped) | 1,050 | 18 min | 16.1% |
+| 5 x 40 | 4,100 | 68 min | 22.1% |
+| 8 x 40 | 6,560 | 109 min | 25.5% |
+| 10 x 50 | 12,750 | 212 min | 29.8% |
+
+Twelve times the keys buys less than double the coverage, so the table should be
+sized from evidence instead. Every vibe query already logs its picks, and a hit
+logs `Precomputed vibe:` against `Live scoring:` for a miss — so after real
+traffic, counting those two lines gives the actual hit rate, and the observed
+picks give a far better candidate list than the corpus ordering does.
+
+### Pruning the pool on tags rather than on rank
+
+Moving to an Ampere A1 made `vibe` roughly 4.8x slower — 19.1 pairs/s against
+91.5 on the quantized x86 box — which put the cap under pressure from the wrong
+direction. Capping harder was the obvious response and the wrong one: the median
+post-filter pool is 580, so a cap of 500 bites the *typical* query rather than
+the tail, and it prunes on cosine rank, which predicts the reranker's order only
+weakly (rho ~ 0.22). Two alternatives prune on the query's own tags instead.
+`scripts/exp_vibe_prefilter.py` measures both over the same 300 held-out users
+and query shapes as the cap sweep, deriving every variant from one full scoring
+per query so the comparisons are exact.
+
+**Raising the cosine floor is the worse lever**, and past 0.30 it stops being
+free at all:
+
+| floor | pairs | overlap@25 | Recall@10 |
+|---|---|---|---|
+| 0.25 (shipped) | 577 | 1.000 | 0.2005 |
+| 0.30 | 358 | 0.752 | 0.2094 |
+| 0.35 | 205 | 0.501 | 0.1790 |
+| 0.45 | 60 | 0.210 | 0.0996 |
+
+**Requiring two shared tags once the query offers three is the better one**, and
+beats every cap on both axes at once (narrow = 1 system + 3 tags, broad = 2 + 6):
+
+| policy | shape | pairs | overlap@25 | ΔNDCG@10 |
+|---|---|---|---|---|
+| tags>=1 (was shipped) | narrow | 577 | 1.000 | — |
+| tags>=1 & system>=1 | narrow | 385 | 0.877 | +0.0017 |
+| **tags>=2 of 3+** | **narrow** | **164** | **0.864** | **+0.0034** |
+| **tags>=2 of 3+** | **broad** | **260** | **0.952** | **−0.0010** |
+
+72% fewer pairs at higher fidelity than `rerank_pool_cap: 500` manages (0.854)
+for a 14% cut. Quality does not move; the deltas are an order of magnitude
+inside the intervals the cap sweep produced on the same 300 users, though
+paired CIs were not recomputed for this run.
+
+Three things this does *not* do, all worth knowing before reading the win as
+larger than it is:
+
+**It only reaches queries offering three or more tags.** A one-tag query cannot
+be asked for two matches, and a two-tag query is left alone deliberately —
+requiring both turns a vibe into a conjunction, cutting one measured pool from
+818 candidates to 45, which is a different product and a page that may not fill.
+Untested here, since both experiment shapes carry three tags or more.
+
+**Fewer tags does not mean a smaller pool** — the opposite, which is what makes
+the gap awkward. The broad shape retrieves *less* before filtering (792 against
+1,011) because a more specific query embeds more specifically. Pool size tracks
+how large the chosen system is: the slowest queries measured were `twine` ones.
+
+**Requirements relax rather than empty.** A pool where nothing shares two tags
+falls back to one, and then to no filtering — a strict rule allowed to return
+nothing would post excellent latency by rendering a blank page.
+
+Live paths only. Precompute keeps one shared tag for the same reason it ignores
+`rerank_pool_cap`: no one is waiting on an offline job, and whole-profile
+queries carry far more tags than the menu-style ones measured here.
+
 ### int8 quantization of the cross-encoder
 
 Dynamic quantization is the only lever here that shortens the *median* query rather than the tail: it scales all scoring by a constant, so unlike a cap it does not work by discarding candidates. Weights are stored as int8 and activations quantized per batch, with no calibration set and no retraining.
@@ -465,6 +575,8 @@ int8   t = 0.82 s + pairs / 91.5
 Both fit within 0.5 s across pools from 174 to 1,390 pairs. Note the fixed term: ~1 s of every query is setup that no amount of pool trimming touches, which is why capping below ~300 candidates stops paying for itself.
 
 With `rerank_pool_cap: 1000` and int8 on fbgemm, a cold vibe query runs **6–7 s typical and 11.7 s worst case**, against 12–14 s / 38 s uncapped and unquantized. The cap does the tail and the quantization does the median; neither substitutes for the other.
+
+On the A1 free-tier host none of that holds: int8 is skipped, the core scores 19.1 pairs/s, and the cap moved to 500 to compensate. The tag policy carries queries of three or more tags (a measured 56.4 s → 12.8 s), and the cap carries the one- and two-tag queries it cannot reach, at roughly 30 s. A one-tag query on a large system is the remaining worst case and neither lever touches it.
 
 Only `vibe` consumes CPU, and it is cached two ways: per session while a user narrows filters, and process-wide across users keyed by (systems, tags). A repeat vibe query costs 0.02 s against several seconds cold. The cache holds 2,048 entries at ~85 KB each, about 171 MB.
 

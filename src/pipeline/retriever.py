@@ -289,6 +289,8 @@ def filter_by_tag_overlap(
     candidates: List[Tuple[str, float]],
     game_info_map: Dict[str, dict],
     query_tags: set,
+    min_matches: int = 1,
+    min_matches_from: Optional[int] = None,
 ) -> List[Tuple[str, float]]:
     """
     Drop candidates sharing no tag with the query, before the reranker sees them.
@@ -302,16 +304,35 @@ def filter_by_tag_overlap(
     Unlike truncating by cosine rank, this prunes on a signal the query is
     actually made of, which is why it costs nothing.
 
-    Returns the input untouched when there are no query tags to match against, or
-    when filtering would empty the pool.
+    `min_matches` raises the bar to several shared tags, and `min_matches_from`
+    is the query-tag count at which that applies — a query offering one tag
+    cannot be asked for two. Requiring 2 of 3+ removes 72% of the pool at 0.86
+    overlap@25 against the unfiltered page, which is a better trade than any
+    cap: `rerank_pool_cap` at 500 discards a seventh of the page to cut a
+    seventh of the work, because it prunes on cosine rank, which predicts the
+    reranker's order only weakly. See the pre-filter experiment in NOTES.
+
+    Requirements relax rather than empty the pool: a query whose candidates
+    share no two tags falls back to one, and then to no filtering at all. A
+    stricter rule that returned nothing would post excellent latency by showing
+    a blank page.
+
+    Returns the input untouched when there are no query tags to match against.
     """
     if not query_tags:
         return candidates
-    kept = [
-        (gid, score) for gid, score in candidates
-        if split_clean(game_info_map.get(gid, {}), "tags") & query_tags
+    required = (min_matches
+                if min_matches_from and len(query_tags) >= min_matches_from
+                else 1)
+    overlaps = [
+        (gid, score, len(split_clean(game_info_map.get(gid, {}), "tags") & query_tags))
+        for gid, score in candidates
     ]
-    return kept or candidates
+    for need in sorted({required, 1}, reverse=True):
+        kept = [(gid, score) for gid, score, n in overlaps if n >= need]
+        if kept:
+            return kept
+    return candidates
 
 
 # Author capping used to live here, applied before truncating the reranker's

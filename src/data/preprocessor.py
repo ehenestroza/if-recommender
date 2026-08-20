@@ -322,6 +322,32 @@ def build_author_profiles(
     return pd.DataFrame(rows).sort_values("game_count", ascending=False).reset_index(drop=True)
 
 
+def canonical_vibe(systems, tags, system_rank=None, tag_rank=None):
+    """
+    Put a vibe pick in a fixed order, so the same picks give the same query.
+
+    A multiselect reports values in click order, which carries no meaning — but
+    it reaches the encoder as text, so "Tags: horror, romance" and "Tags:
+    romance, horror" embed differently and return pages that differ by 4-12% of
+    their entries. Two people wanting the same thing get different answers, and
+    a lookup table would have to store both spellings to catch either.
+
+    Ordered by corpus frequency rather than alphabetically, because that is how
+    the profiles the encoder trained on were built, and how the pickers list
+    their options — so a canonical query stays in distribution instead of
+    landing in an ordering the model never saw. Duplicates are dropped, and
+    anything unranked sorts last, alphabetically, so the result is total.
+    """
+    system_rank = system_rank or {}
+    tag_rank = tag_rank or {}
+    far = float("inf")
+    ordered_systems = sorted(dict.fromkeys(systems),
+                             key=lambda v: (system_rank.get(v, far), v))
+    ordered_tags = sorted(dict.fromkeys(tags),
+                          key=lambda v: (tag_rank.get(v, far), v))
+    return ordered_systems, ordered_tags
+
+
 def parse_profile_text(text: str) -> Tuple[List[str], List[str]]:
     """Inverse of `format_profile_text` — recover (systems, tags) from a query."""
     systems: List[str] = []

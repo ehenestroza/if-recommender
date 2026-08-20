@@ -524,6 +524,11 @@ def load_artefacts(cfg: dict):
                                         excluded_games)
     precomputed_author = load_precomputed(data_dir / "precomputed_authorid.parquet", "authorid",
                                           excluded_games)
+    # Keyed by the canonical query text rather than an id, because a vibe pick
+    # has no id — `canonical_vibe` is what makes the same picks produce the same
+    # key whatever order they were clicked in.
+    precomputed_vibe = load_precomputed(data_dir / "precomputed_vibe.parquet", "query",
+                                        excluded_games)
 
     return (
         retriever, reranker, query_encoder,
@@ -534,6 +539,7 @@ def load_artefacts(cfg: dict):
         game_info_map,
         precomputed_user, precomputed_game, precomputed_author,
         author_profile_map, author_name_map, author_games,
+        precomputed_vibe,
     )
 
 
@@ -681,6 +687,8 @@ def run_interactive(
     top_k_rank      = retr_cfg["top_k_rerank"]
     pool_cap        = retr_cfg.get("rerank_pool_cap", 0)
     prefilter_tags  = retr_cfg.get("prefilter_by_tag", True)
+    prefilter_tag_matches = retr_cfg.get("prefilter_tag_matches", 1)
+    prefilter_tag_matches_from = retr_cfg.get("prefilter_tag_matches_from")
     rating_w        = retr_cfg.get("rating_weight", 0.5)
     use_diversity   = retr_cfg.get("use_diversity", False)
 
@@ -775,7 +783,9 @@ def run_interactive(
                 if query_tags:
                     before = len(candidates)
                     candidates = filter_by_tag_overlap(
-                        candidates, game_info_map, set(query_tags)
+                        candidates, game_info_map, set(query_tags),
+                        min_matches=prefilter_tag_matches,
+                        min_matches_from=prefilter_tag_matches_from,
                     )
                     if len(candidates) < before:
                         logger.info("Tag pre-filter: %d → %d candidates", before, len(candidates))
@@ -943,6 +953,7 @@ def main() -> None:
         game_info_map,
         precomputed_user, precomputed_game, precomputed_author,
         author_profile_map, author_name_map, author_games,
+        precomputed_vibe,
     ) = load_artefacts(cfg)
 
     if args.mode == "interactive":

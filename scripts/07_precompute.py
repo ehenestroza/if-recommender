@@ -47,8 +47,10 @@ from src.utils.env import configure_logging
 configure_logging()
 
 from src.data.preprocessor import (  # noqa: E402
-    author_game_map, build_author_profiles, parse_profile_text,
+    author_game_map, build_author_profiles, canonical_vibe, format_profile_text,
+    parse_profile_text,
 )
+from src.data.pickers import vocab_choices  # noqa: E402
 from src.pipeline.retriever import filter_by_tag_overlap  # noqa: E402
 
 logger = logging.getLogger(__name__)
@@ -56,6 +58,7 @@ logger = logging.getLogger(__name__)
 USERID_FILE = "precomputed_userid.parquet"
 GAMEID_FILE = "precomputed_gameid.parquet"
 AUTHORID_FILE = "precomputed_authorid.parquet"
+VIBE_FILE = "precomputed_vibe.parquet"
 
 
 def _load_pipeline_module():
@@ -69,6 +72,42 @@ def _load_pipeline_module():
     return module
 
 
+def vibe_combinations(game_docs, n_systems: int, n_tags: int):
+    """
+    The vibe picks worth storing: every system paired with one tag, and with
+    every unordered pair of tags, over the commonest of each.
+
+    Unordered — `canonical_vibe` collapses click order, so (horror, romance) and
+    (romance, horror) are one entry rather than two. That halves the job and is
+    the only reason a lookup can hit at all.
+
+    Deliberately one and two tags. Queries offering three or more are already
+    cheap: `prefilter_tag_matches` requires two matches of them, which cut the
+    worst measured query from 1,000 scored pairs to 168. It is one- and two-tag
+    picks that the tag policy cannot help and the cap has to catch, so they are
+    exactly what is worth having in a table.
+    """
+    systems = [value for _label, value in vocab_choices(game_docs)[0][:n_systems]]
+    tags = [value for _label, value in vocab_choices(game_docs)[1][:n_tags]]
+    rank_s = {v: i for i, v in enumerate(systems)}
+    rank_t = {v: i for i, v in enumerate(tags)}
+
+    picks = []
+    for system in systems:
+        for i, tag in enumerate(tags):
+            picks.append(([system], [tag]))
+            for other in tags[i + 1:]:
+                picks.append(([system], [tag, other]))
+    seen, out = set(), []
+    for sys_pick, tag_pick in picks:
+        s_can, t_can = canonical_vibe(sys_pick, tag_pick, rank_s, rank_t)
+        key = format_profile_text(s_can, t_can)
+        if key not in seen:
+            seen.add(key)
+            out.append(key)
+    return out
+
+
 def _rank_one(emb, exclude, retriever, reranker, doc_map, cfg_r,
               bayesian_avg_map, query_text, top_n, game_info_map=None):
     """Retrieve, score the whole pool, and return the top_n (gameid, score, relevance)."""
@@ -80,6 +119,12 @@ def _rank_one(emb, exclude, retriever, reranker, doc_map, cfg_r,
     # always see why a recommendation was made. This also yields more usable
     # depth than a relevance floor alone — see README, "Precompute the
     # enumerable modes".
+    # One shared tag here, whatever the live paths are set to. `prefilter_tag_
+    # matches` exists to buy latency, and an offline job has no latency to buy —
+    # the same reason precompute ignores `rerank_pool_cap`. It also measures
+    # differently: the experiment behind that setting used menu-style vibe
+    # queries of three to six tags, while these are whole profiles carrying far
+    # more, where requiring two matches prunes a pool nobody is waiting on.
     if cfg_r.get("prefilter_by_tag", True) and game_info_map is not None:
         _, query_tags = parse_profile_text(query_text)
         if query_tags:
@@ -170,7 +215,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Precompute lookup rankings")
     parser.add_argument("--config", default="config.yaml")
     parser.add_argument("--mode", default="all",
-                        choices=["userid", "game_id", "author_id", "all"])
+                        choices=["userid", "game_id", "author_id", "vibe", "all"])
+    parser.add_argument("--vibe-systems", type=int, default=5)
+    parser.add_argument("--vibe-tags", type=int, default=20)
     parser.add_argument("--top-n", type=int, default=500)
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--out", default=None)
@@ -225,6 +272,29 @@ def main() -> None:
                 rate = i / (time.time() - t0)
                 logger.info("  %d/%d users (%.1f/s, ETA %.0f min)",
                             i, len(users), rate, (len(users) - i) / rate / 60)
+        writer.close()
+
+    if args.mode in ("vibe", "all"):
+        # Every other table here is keyed by something that exists — a user, a
+        # game, an author. A vibe pick is keyed by what the reader assembled, so
+        # the keys are enumerated rather than looked up, and only the common
+        # corner of a combinatorial space is worth storing.
+        keys = vibe_combinations(game_docs, args.vibe_systems, args.vibe_tags)
+        if args.limit:
+            keys = keys[: args.limit]
+        logger.info("Precomputing %d vibe rankings (top %d each, %d systems x %d tags) …",
+                    len(keys), top_n, args.vibe_systems, args.vibe_tags)
+        writer, t0 = _ChunkWriter(out_dir / VIBE_FILE, "query"), time.time()
+        for i, query_text in enumerate(keys, 1):
+            emb = query_encoder.encode([query_text], normalize_embeddings=True,
+                                       show_progress_bar=False)[0]
+            ranked = _rank_one(emb, set(), retriever, reranker, doc_map, cfg_r,
+                               bayesian_avg_map, query_text, top_n, game_info_map)
+            writer.add([(query_text, g, s, r, n) for n, (g, s, r) in enumerate(ranked, 1)])
+            if i % 25 == 0:
+                rate = i / (time.time() - t0)
+                logger.info("  %d/%d vibes (%.2f/s, ETA %.0f min)",
+                            i, len(keys), rate, (len(keys) - i) / rate / 60)
         writer.close()
 
     if args.mode in ("game_id", "all"):

@@ -73,7 +73,11 @@ for systems, tags in QUERIES:
         candidates = retriever.index.search(emb, min_score=min_score)
         _, qtags = parse_profile_text(query_text)
         if qtags:
-            candidates = filter_by_tag_overlap(candidates, game_info_map, set(qtags))
+            candidates = filter_by_tag_overlap(
+                candidates, game_info_map, set(qtags),
+                min_matches=retr.get("prefilter_tag_matches", 1),
+                min_matches_from=retr.get("prefilter_tag_matches_from"),
+            )
         candidates = candidates[:cap]
         actual_scored, _ = reranker.rerank(
             query_text=query_text, candidates=candidates, game_doc_lookup=doc_map,
