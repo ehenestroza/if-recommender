@@ -247,7 +247,23 @@ Cloud-init already installs certbot from snap and links it onto the path, so the
 
 Add port 443 to the **security list** first — that is the VCN setting, same as port 80 above. The instance-side iptables rule for 443 is already opened by cloud-init, so there is nothing to run for it.
 
-Certbot rewrites the nginx site in place and sets up renewal.
+Certbot rewrites the nginx site in place and sets up renewal. Check both, rather than taking the second on trust — a certificate that silently stops renewing fails in ninety days, long after anyone is still watching this deploy:
+
+```bash
+curl -sI https://your-domain.example/          # 200, and the cert validates
+sudo certbot renew --dry-run                   # a real renewal, against staging
+systemctl list-timers | grep -i certbot        # and something scheduled to do it
+```
+
+**Every certbot command needs root**, including the read-only-looking ones: it takes a lock in `/var/log/letsencrypt` before doing anything, so a bare `certbot renew --dry-run` stops at `[Errno 13] Permission denied` on the lock file rather than telling you to use sudo.
+
+The snap registers an ordinary systemd timer, so the third check reports a next-run time:
+
+```
+snap.certbot.renew.timer   snap.certbot.renew.service
+```
+
+`snap services certbot` says the same thing from the other side — `enabled`, `timer-activated`, and `inactive` between runs, which is what a timer-driven unit looks like when it is working rather than a sign that anything is wrong.
 
 **Point DNS at the instance before running certbot.** The HTTP-01 challenge resolves the name and must reach *this* box; running it early fails, and running it against a stale record issues for the wrong host.
 
