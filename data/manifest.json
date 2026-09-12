@@ -1,9 +1,22 @@
 {
   "source": {
-    "path": "dump/ifdb-archive.sql.gz",
-    "sha256": "b7ce4b69f2b8e74756071bc15dd46f5a33ba86dc42ba6595156aa345834a625c"
+    "path": "dump/ifdb-archive-20260901.sql.gz",
+    "sha256": "5a9703d3a261a055abc25ffe1c52f7fd0c8e7f152f9abe2018158531bdf364ae"
   },
   "tables": {
+    "crossrecs": {
+      "columns": [
+        "crossrecid",
+        "fromgame",
+        "togame",
+        "userid",
+        "notes",
+        "created"
+      ],
+      "file": "crossrecs.parquet",
+      "rows": 399,
+      "sha256": "a0c45b62a736b8e30e8df19c8022a6237ccc43cab3ef3f761fe0a6d7ee1dbc96"
+    },
     "games": {
       "columns": [
         "gameid",
@@ -34,8 +47,30 @@
         "flags"
       ],
       "file": "games.parquet",
-      "rows": 15544,
-      "sha256": "55580c800cfe22004578ce0ab235377b07fd18b83d111aab58bd389a88412457"
+      "rows": 15747,
+      "sha256": "e002fe545e3f3bb1d0e2607e185f9ad31760a05218ea0d7dc8b8dcc6edec4403"
+    },
+    "gamexrefs": {
+      "columns": [
+        "fromid",
+        "toid",
+        "reftype",
+        "displayorder"
+      ],
+      "file": "gamexrefs.parquet",
+      "rows": 964,
+      "sha256": "9fd227ced6f0f87468fa77d21e6805cd7926f8f1ac2277a1daf9837b7e54b65f"
+    },
+    "gamexreftypes": {
+      "columns": [
+        "reftype",
+        "fromname",
+        "toname",
+        "tonames"
+      ],
+      "file": "gamexreftypes.parquet",
+      "rows": 9,
+      "sha256": "e3e010015433a3295c29481977955698180d2da4e79fb569709f4d76ee2ef254"
     },
     "playedgames": {
       "columns": [
@@ -44,12 +79,64 @@
         "date_added"
       ],
       "file": "playedgames.parquet",
-      "rows": 71033,
-      "sha256": "ba72418bb7cbfc33e8a37b7f64a970e3b0783f5eb514d9da05b1c322846cadee"
+      "rows": 71928,
+      "sha256": "0c97fcf48cd827ca96d63f1ebdd45c2d438ce9da4729011021140d5821af8652"
+    },
+    "polls": {
+      "columns": [
+        "pollid",
+        "title",
+        "keywords",
+        "desc",
+        "created",
+        "userid",
+        "flags"
+      ],
+      "file": "polls.parquet",
+      "rows": 704,
+      "sha256": "d7eac144ff9aa902ef0ba3c05b393644f5c1a86413061ee921f493bf10b4dbea"
+    },
+    "pollvotes": {
+      "columns": [
+        "pollid",
+        "gameid",
+        "userid",
+        "quickquote",
+        "notes",
+        "votedate"
+      ],
+      "file": "pollvotes.parquet",
+      "rows": 22827,
+      "sha256": "33a0be5648cda21aa10540f706f7b88a1137933401e753a0305e6cf2024e1a3b"
+    },
+    "reclistitems": {
+      "columns": [
+        "listid",
+        "gameid",
+        "comments",
+        "displayorder"
+      ],
+      "file": "reclistitems.parquet",
+      "rows": 6970,
+      "sha256": "1db422f26a79dafab3abdee04a44fee135be351b5e5e7a4f2081110a682b742e"
+    },
+    "reclists": {
+      "columns": [
+        "listid",
+        "title",
+        "keywords",
+        "desc",
+        "userid",
+        "createdate",
+        "moddate"
+      ],
+      "file": "reclists.parquet",
+      "rows": 578,
+      "sha256": "6923186698fc8265bff68999325165389445435d174f13f9f72e9388aa966571"
     },
     "reviews": {
       "columns": [
-        "id",
+        "reviewid",
         "summary",
         "review",
         "rating",
@@ -63,8 +150,8 @@
         "embargopastdate"
       ],
       "file": "reviews.parquet",
-      "rows": 80244,
-      "sha256": "dcd36b4ae670f59571c5e6a748b922cd6be38f8c645ce059a48e3d9cdcee305a"
+      "rows": 81200,
+      "sha256": "2819ea1db31f88ac8c9e27689e947918814a5a8411bee9fef329f5b1da2f3f8b"
     },
     "users": {
       "columns": [
@@ -79,8 +166,18 @@
         "welcomeopen"
       ],
       "file": "users.parquet",
-      "rows": 20024,
-      "sha256": "edaeebd09e9d59e67faffa783eb361bc89df25cadb12fb22ad01ca72115fb631"
+      "rows": 20377,
+      "sha256": "85372389886f1434a7f6d7474e9f63778ffd7bee139bcf0207a21d6d3fdda3b5"
+    },
+    "wishlists": {
+      "columns": [
+        "gameid",
+        "userid",
+        "date_added"
+      ],
+      "file": "wishlists.parquet",
+      "rows": 51269,
+      "sha256": "b763aa48cce59d64105e5beb55ce2dda6fd2d435e8bc2a93b44cd5dc6ce26053"
     }
   }
 }

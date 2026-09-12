@@ -37,6 +37,25 @@ class Retriever:
         # Query-encoder embeddings of game profile texts (no description).
         # Used for game_id queries so we search doc-space from the query side.
         self.game_query_embeddings: Dict[str, np.ndarray] = game_query_embeddings or {}
+        # Item-to-item space (src/pipeline/items.py), attached by the loader
+        # when 05_build_index.py produced one. Serves game and author modes;
+        # without it those modes fall back to `_encode_game_ids` profile queries.
+        self.items = None
+
+    def rank_items(self, seeds, exclude=None, merge: str = "centroid",
+                   min_score: float = 0.0, top_n=None, bayesian_avg_map=None,
+                   rating_weight: float = 0.5, allowed=None):
+        """
+        Rank the corpus by nearest neighbours to `seeds` in the item space.
+        Same `(scored, relevance)` shape as `Reranker.rerank`. None if there is
+        no item space, so callers can fall back to the profile path.
+        """
+        if self.items is None:
+            return None
+        return self.items.rank(
+            seeds, exclude=exclude, merge=merge, min_score=min_score, top_n=top_n,
+            bayesian_avg_map=bayesian_avg_map, rating_weight=rating_weight, allowed=allowed,
+        )
 
     # ------------------------------------------------------------------
     # Query encoders

@@ -196,14 +196,15 @@ def diversify_results(
 
     1. Author variety — a candidate is set aside if adding it would let one author
        appear more than max_author_appearances times, so a prolific author cannot
-       fill the page. The cap yields in two situations where it would work against
-       the user:
-
-         * `cap_authors=False` — the caller filtered *by* author, so wanting more
-           than two of their games is the entire point of the request.
-         * Too few results — if the cap leaves fewer than top_k, the highest-scored
-           set-aside candidates are added back until the page is full. Variety the
-           user can see is worth less than the slots they asked for.
+       fill the page. Set-aside candidates are not discarded: they are appended
+       after everything that passed, in score order, so a short page still fills
+       — but from the tail, never by outranking another author's first game.
+       (They used to be merged back by score whenever the page was short. The
+       web app asks for the whole pool and paginates itself, so "short" was
+       always true there and the cap did nothing; four games by one author in a
+       top five is what that looked like.) The cap yields when
+       `cap_authors=False` — the caller filtered *by* author, so wanting more
+       than two of their games is the entire point of the request.
 
     2. Coverage — if the initial top_k misses a target genre or system,
        the highest-scored remaining candidate covering that target is swapped
@@ -234,11 +235,10 @@ def diversify_results(
             for a in game_authors:
                 author_counts[a] = author_counts.get(a, 0) + 1
 
-        if len(deduped) < top_k and overflow:
-            shortfall = top_k - len(deduped)
-            logger.debug("Author cap left %d of %d slots; backfilling %d",
-                         len(deduped), top_k, min(shortfall, len(overflow)))
-            deduped = sorted(deduped + overflow[:shortfall], key=lambda pair: -pair[1])
+        if overflow:
+            logger.debug("Author cap set aside %d of %d candidates; appended after the rest",
+                         len(overflow), len(candidates))
+            deduped = deduped + overflow
 
     if not target_genres and not target_systems:
         return deduped[:top_k]

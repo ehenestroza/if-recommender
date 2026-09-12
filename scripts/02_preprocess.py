@@ -22,6 +22,7 @@ import argparse
 import logging
 import sys
 from pathlib import Path
+from typing import Optional
 
 import pandas as pd
 import yaml
@@ -37,6 +38,7 @@ from src.data.preprocessor import (
     build_interactions,
     split_interactions,
     build_user_profiles,
+    build_item_sets,
 )
 
 logger = logging.getLogger(__name__)
@@ -174,11 +176,9 @@ def main() -> None:
         min_reviews_per_user=1,
         min_reviews_per_game=1,
     )
-    all_positives = all_interactions[all_interactions["label"] == 1][
-        ["userid", "gameid", "label"]
-    ].copy()
+    # Both labels: the negatives feed the profile's `Dislikes` section.
     user_profiles_retrieval = build_user_profiles(
-        interactions=all_positives,
+        interactions=all_interactions[["userid", "gameid", "label"]].copy(),
         game_docs=game_docs_retrieval,
         reviews=reviews,
         users=users,
@@ -189,6 +189,27 @@ def main() -> None:
     logger.info(
         "Saved user_profiles_retrieval.parquet (%d users)", len(user_profiles_retrieval)
     )
+
+    # ------------------------------------------------------------------ #
+    # 5. Item co-occurrence sets (item-to-item encoder)
+    # ------------------------------------------------------------------ #
+    logger.info("Building item co-occurrence sets …")
+
+    def _optional(name: str) -> Optional[pd.DataFrame]:
+        path = data_dir / name
+        return pd.read_parquet(path) if path.exists() else None
+
+    item_sets = build_item_sets(
+        interactions=all_splits,
+        reviews=reviews,
+        game_docs=game_docs_retrieval,
+        wishlists=_optional("wishlists.parquet"),
+        pollvotes=_optional("pollvotes.parquet"),
+        reclists=_optional("reclists.parquet"),
+        reclistitems=_optional("reclistitems.parquet"),
+    )
+    item_sets.to_parquet(data_dir / "item_sets.parquet", index=False)
+    logger.info("Saved item_sets.parquet (%d rows)", len(item_sets))
 
     # ------------------------------------------------------------------ #
     # Summary

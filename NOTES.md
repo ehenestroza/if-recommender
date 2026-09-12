@@ -13,6 +13,7 @@ Most of the design decisions below were settled by measurement rather than judge
 - [How queries are built](#how-queries-are-built)
 - [Filtering and display](#filtering-and-display)
 - [Evaluation](#evaluation)
+- [Item-to-item modes](#item-to-item-modes)
 - [Experiments](#experiments)
 - [Deployment](#deployment)
 - [Possible extensions](#possible-extensions)
@@ -21,18 +22,24 @@ Most of the design decisions below were settled by measurement rather than judge
 
 ## The data
 
-From the [IFArchive](https://ifarchive.org/indexes/if-archive/info/ifdb/) dump of the IFDB database:
+From the [IFArchive](https://ifarchive.org/indexes/if-archive/info/ifdb/) dump of the IFDB database (`ifdb-archive-20260901`):
 
 | Table | Rows | Role |
 |---|---|---|
-| `games` | 15,544 | Title, author, system, genre, tags, description |
-| `reviews` | 80,244 | Explicit 1–5★ ratings — the supervision signal |
-| `users` | 20,024 | Accounts, for profiles and filtering |
-| `playedgames` | 71,033 | Implicit engagement, used to suppress already-played games |
+| `games` | 15,747 | Title, author, system, genre, tags, description, year, language |
+| `reviews` | 81,200 | Explicit 1–5★ ratings — the supervision signal |
+| `users` | 20,377 | Accounts, for profiles and filtering |
+| `playedgames` | 71,928 | Implicit engagement, used to suppress already-played games |
+| `wishlists` | 51,269 | A user's wishlist — item co-occurrence |
+| `polls`, `pollvotes` | 704 / 22,827 | Games voted into one poll ("Best short games") — item co-occurrence |
+| `reclists`, `reclistitems` | 578 / 6,970 | A member's recommended list — item co-occurrence |
+| `crossrecs`, `gamexrefs`, `gamexreftypes` | 399 / 964 / 9 | Explicit "if you liked X" links and sequel/remake relations; too few to train on, kept for sanity checks |
+
+The last four groups feed the item-to-item encoder (see [Item-to-item modes](#item-to-item-modes)). They were chosen after an audit of every table in the dump; what was looked at and left out is recorded under [What the dump does and does not offer](#what-the-dump-does-and-does-not-offer).
 
 ### Extraction
 
-`scripts/01_extract.py` starts a disposable MariaDB container (`mariadb:10.5.26`, matching the dump's server version), streams the gzipped dump straight into it without expanding to disk, extracts the four tables to Parquet, and removes the container. Nothing persists between runs, which is also what makes it safe to run in CI.
+`scripts/01_extract.py` starts a disposable MariaDB container (`mariadb:10.5.26`, matching the dump's server version), streams the gzipped dump straight into it without expanding to disk, extracts the twelve tables to Parquet, and removes the container. Every table's primary key is `id` in IFDB, so each is renamed on the way out (`gameid`, `userid`, `reviewid`, `listid`, `crossrecid`) rather than guessed at. Nothing persists between runs, which is also what makes it safe to run in CI.
 
 Re-extracting the same dump produces byte-identical Parquet files. Two things buy that: every table is read with an `ORDER BY` on its primary key, and the pandas/pyarrow version stamp is stripped from the schema metadata. `data/manifest.json` records the dump's SHA-256 alongside each table's row count and checksum, with no timestamp — so two manifests compare equal exactly when the data does.
 
@@ -40,11 +47,36 @@ If you would rather read from a MySQL you already run, `--source mysql` skips th
 
 ### Preparation
 
-Each game becomes a document like `Title: … Author: … Systems: … Tags: … Description: …`, and each user a profile like `Systems: twine, inform. Tags: parser, fantasy, …` built from the games they rated highly.
+Each game becomes a document:
+
+```
+Title: … Author: … Systems: … Tags: … Language: english. Description: …
+```
+
+and each user a profile built from the games they rated highly:
+
+```
+Systems: inform, twine. Tags: parser, fantasy, … Authors: Emily Short, Andrew Plotkin.
+Language: spanish. Dislikes: puzzleless, recommended for beginners
+```
+
+Only the sections with values are written, so a vibe pick of systems and tags comes out exactly as it did before the later sections existed. Language sits ahead of the description in the document, which is the part the 256-token limit truncates.
+
+The later profile sections came with the 2026-09 dump, and each was chosen from the data rather than on instinct:
+
+- **Authors** — the five authors liked most often. Documents carry `Author:`, so this gives the cross-encoder an exact-match path. It is a real signal — 24.5% of test positives are by an author the user had already liked — and the strongest single section by a wide margin (see [Profile sections](#which-profile-sections-matter)). It also concentrates: 51% of a raw top-10 is by an already-liked author, which the page's ≤2-per-author cap keeps in proportion.
+- **Language** — languages meeting the same bar, written only when something other than English qualifies: on its own, "english" is a constant token that says nothing. 13% of games are non-English.
+- **Dislikes** — systems and tags that mark the user's *disliked* games out from their liked ones. See below.
+
+Two things were tried and taken out again. **`Era`** — the decades holding a quarter of the liked set — and **`Year:`** in the document. Era measured neutral for retrieval (see [Profile sections](#which-profile-sections-matter)), and the pair of them turned period into a cutoff: a decade token cannot say that 2019 is closer to 2020 than to 2010, and the item encoder, given `Year:` on both sides of every pair, learned to match the year and little else (see [Item-to-item modes](#item-to-item-modes)). The year filter is where a period preference belongs — a filter is allowed to be a cutoff. Whatever temporal closeness the recommendations still show comes from the co-occurrence data itself, softly.
 
 Interactions are labelled *relative to each game's quality* rather than on an absolute scale. A 3★ review of a 2.7★ game is a positive; the same rating on a 3.3★ game is a negative. Ratings within ±0.25 of the game's smoothed average are discarded as ambiguous. This keeps the signal consistent across games with very different rating distributions.
 
-Author profiles are built the same way, aggregated over an author's own catalogue. Single-game authors are included: their profile comes out byte-identical to that game's query text in 4,711 of 4,713 cases, so the mode duplicates `game` search for them — which is the point, since nobody picking an author knows or cares how many games they wrote.
+**Dislikes are discriminative, not a mirror of "top tags".** A disliked game carries the same ordinary tags a liked one does — "parser", "fantasy" — so the most common tags across a user's negatives would just restate the most common tags across everything. A value qualifies instead when at least two disliked games carry it *and* it is commoner among the disliked games than among the liked ones, ranked by that gap and capped at ten; anything already in the liked list is excluded, so a profile cannot both like and dislike a tag. 39% of training profiles get a list; the rest have too little or too undifferentiated a negative history, and get nothing rather than noise.
+
+**Negatives are held out too.** Users with three or more negatives keep ~10% of them (at least one) in the test split with `label=0`, so the evaluation can check that disliked games rank *low* — 3,033 held-out negatives against 3,403 held-out positives. Without them the value of a dislike section is invisible to the metrics.
+
+Author profiles are built the same way, aggregated over an author's own catalogue. They are now display text only: `author` search runs in the item space (see [Item-to-item modes](#item-to-item-modes)).
 
 ### Original vs. normalised columns
 
@@ -58,35 +90,45 @@ So originals keep their own names and every normalised variant sits beside them 
 | system | `system` | `system_clean` — parentheticals and versions stripped |
 | tags | `tags` | `tags_clean` — genre folded in, competition tags dropped, capped at 20 |
 | genre | `genre` | folded into `tags_clean` |
-| published | `published` | `year`, for range filters |
+| published | `published` | `year`, for range filters and the document |
+| language | `language` | `language_clean` — codes and variants resolved to lowercase names |
 
 A game IFDB lists as `Inform 7` normalises to `inform`; showing that back would look like a bug.
+
+**Tags are ordered by corpus frequency before the 20-tag cap.** IFDB stores tags in the order they were voted, and one game carries fifty; cutting at twenty used to keep whichever came first. Frequency order keeps the tags a profile can actually contain — a tag on one game in the corpus matches nothing else — and puts genre values, which were set deliberately, in front. Dropped this way, the 2,411 games with any tag voted by more than one user lose nothing that mattered: nearly every vote count is one, which is also why tag weights were not worth adding.
 
 ---
 
 ## Pipeline
 
+Two routes into the same tail. `reviewer` and `vibe` are profile queries; `game` and `author` are item-space lookups.
+
 ```
-query profile ──► [ query encoder ]──► 384d ─┐
-                                             ├─► FAISS, everything above threshold
-game document ──► [ doc encoder   ]──► 384d ─┘
-                                                    │
-                          ──► [ cross-encoder reranker ]──► scored pool (cached)
-                                                    │
-                                        reordered by relevance
-                                        (score selected the pool)
-                                                    │
-                                              hard filters
-                                                    │
-                                        diversity: ≤2 per author,
-                                        cover the query's top systems
-                                                    │
-                                              page of results
+reviewer / vibe                                game / author
+query profile ──► [ query encoder ]──► 384d ─┐    seed game(s) ──► [ item encoder ] ──► 384d
+                                             ├─► FAISS, above threshold        │
+game document ──► [ doc encoder   ]──► 384d ─┘        │                  nearest neighbours
+                                                      │                  (centroid of seeds)
+                            ──► [ cross-encoder reranker ]                     │
+                                                      │                        │
+                                                      └──────► scored pool ◄───┘
+                                                                    │
+                                                        reordered by relevance
+                                                        (score selected the pool)
+                                                                    │
+                                                              hard filters
+                                                                    │
+                                                        diversity: ≤2 per author,
+                                                        cover the query's top systems
+                                                                    │
+                                                              page of results
 ```
 
 **Two-tower bi-encoder.** Query and document towers start from the same `all-MiniLM-L6-v2` checkpoint but are fine-tuned with separate weights, so each specialises for its own input shape — short tag-heavy profiles on one side, longer prose documents on the other. Trained with InfoNCE and in-batch negatives at batch size 64, so each positive competes against 63 negatives, many of them genuinely close.
 
 **Cross-encoder reranker.** `ms-marco-MiniLM-L6-v2`, fine-tuned on the same labelled interactions. Sigmoid over the raw logit gives a 0–1 relevance score.
+
+**Item encoder.** A third tower, one input shape — a game document — trained so that games which belong together in someone's mind embed close: `game` and `author` searches are nearest-neighbour lookups in its space, with no reranker. See [Item-to-item modes](#item-to-item-modes) for why, and for what it is trained on.
 
 **The blend.**
 
@@ -110,7 +152,9 @@ Two properties are deliberate:
 
 **Deep reranking, capped at the tail.** The reranker scores every candidate above the retrieval threshold up to `rerank_pool_cap` (500 since the move to ARM; 1,000 on x86), applied after the tag pre-filter. Cosine rank and cross-encoder rank correlate only weakly (Spearman ρ ≈ 0.22), so truncating aggressively discards most of what the reranker would have picked — but a median vibe pool is 580 candidates, so the cap binds only on the long tail and leaves the typical query scored end to end. See [the cap experiment](#where-the-cap-belongs-and-what-it-costs) for what it costs, which is nothing measurable.
 
-The bi-encoder is doing the pruning either way: a threshold rather than a top-K, but it still takes 10,087 games down to a median of 927 before the cross-encoder sees anything.
+The bi-encoder is doing the pruning either way: a threshold rather than a top-K, but it still takes 10,291 games down to a median of about 1,000 before the cross-encoder sees anything.
+
+**The threshold belongs to the model, not the design.** With the 2026-09 profiles the query tower embeds more specifically and the whole cosine distribution sits about 0.1 lower — the best match for a median user is 0.64 where it was 0.67, and the body of the pool moved further. At the old floor of 0.25 the median pool was 136 candidates and a fifth of users had fewer than 25 stored results; at 0.15 it is 1,010, which is what the cap, the tag policy and the headroom figures below were all measured against. The experiment tables in this file that quote 0.25 as "shipped" predate the change and are left as measured.
 
 ---
 
@@ -126,13 +170,19 @@ query = format_profile_text(["twine"], ["fantasy", "horror"])
 # "Systems: twine. Tags: fantasy, horror"
 ```
 
-Both helpers read the `_clean` columns, so the values a UI offers are exactly the ones the encoders saw. `format_profile_text` is the same function that builds user and game profiles during preprocessing, so all query sources are identical by construction.
+Both helpers read the `_clean` columns, so the values a UI offers are exactly the ones the encoders saw. `format_profile_text` is the same function that builds user profiles during preprocessing, so all query sources are identical by construction. It takes the later sections (`authors`, `languages`, `dislikes`) as optional arguments, and the web app's vibe mode offers a picker for one of them: authors, the strongest section there is. Not dislikes, which measured as doing nothing to the ranking (see [Profile sections](#which-profile-sections-matter)) — a control that does nothing would be a lie. And not language, though the profiles carry it: to a reader it is a constraint rather than a taste, the hardest filter there is for anyone who reads one language, and offering it beside the tags asked them to guess whether it narrowed or merely nudged. It is a filter, where a constraint belongs. Picks are put in corpus order, as systems and tags are, so the same picks make the same query.
+
+`parse_profile_sections` is the inverse, and finds sections by their labels rather than by splitting on `". "` — an author name like "jennifer s. lange" has a period of its own. A label counts only at the start of the text or after a sentence break, so a tag such as "era: victorian" inside a list is not mistaken for the `Era` section.
+
+`game` and `author` queries do not go through this at all: they are seed ids into the item space. The profile text is still built for them, to show in the query panel and to pick the diversity targets.
 
 **Free text is not supported.** Both towers train only on `(profile, document)` pairs, and prose lands measurably outside that distribution — best cosine 0.447 against 0.670 for profile format. A UI should offer pickers, not a text box.
 
 ---
 
 ## Filtering and display
+
+**The author cap works on the whole ranking, not a page.** `diversify_results` sets aside an author's third and later games; they now go to the tail of the list in score order, so a short page still fills from them but they never outrank another author's first. They used to be merged back by score whenever the cap left fewer than `top_k` — and the web app asks for the whole pool and paginates itself, so `top_k` was the pool size, the page was always "short", and the cap had been doing nothing there since local pagination arrived. It surfaced once the `Authors` section made same-author concentration common: four games by one author in a reviewer's top five.
 
 Filters narrow a ranking you are already looking at. They run after scoring, so they never change which candidates were ranked — the scores you see are identical filtered or not.
 
@@ -238,43 +288,184 @@ Tags split on commas only — `gay/queer protagonist` is one tag — while syste
 
 ## Evaluation
 
-Recall@K, NDCG@K and MRR against held-out test-split positives, 1,887 users.
+Recall@K, NDCG@K and MRR against held-out test-split positives, 2,020 users with a test item (1,920 of them with a profile), plus NegHit@K — the share of a user's held-out *disliked* games that reach their top K, which should be low — over the 908 users who have any.
 
 ```bash
 uv run scripts/06_run_recommender.py --mode evaluate            # raw retrieval  (~25 s)
-uv run scripts/06_run_recommender.py --mode evaluate --rerank   # full pipeline  (~51 min)
+uv run scripts/06_run_recommender.py --mode evaluate --rerank   # full pipeline  (~50 min)
+uv run scripts/eval_item_modes.py --rerank-sample 300           # game and author modes
 ```
 
-| Metric | Raw retrieval | + Reranking |
-|---|---|---|
-| MRR | 0.2574 | **0.2847** |
-| Recall@5 | 0.3119 | **0.3687** |
-| Recall@10 | 0.3606 | **0.4315** |
-| Recall@20 | 0.4099 | **0.4777** |
-| Recall@50 | 0.4816 | **0.5545** |
-| NDCG@5 | 0.2582 | **0.2889** |
-| NDCG@10 | 0.2743 | **0.3097** |
-| NDCG@50 | 0.3028 | **0.3392** |
+**Queries are the training profiles, not the serving ones.** The profiles the app serves (`user_profiles_retrieval.parquet`) are built from every rating a user made — including the test positives being looked for — and the evaluation used to query with them. That leaked: the held-out game's own tags sat in the query, and with the `Authors` section its author did too. On the 2026-09 data the leak was worth Recall@10 0.387 against an honest 0.229 for the unchanged pipeline, and 0.537 against 0.363 with the new profiles. Every figure below is leak-free (`--profiles train`, the default now); the earlier write-ups' numbers were not, and are superseded rather than restated.
 
-Reranking is worth +20% Recall@10 and +13% NDCG@10. `Recall@1` and `NDCG@1` barely move, which fits: the reranker reorders the body of the list rather than changing which single game lands on top.
+Baseline is the previous pipeline retrained on the 2026-09 dump, so the only difference between the columns is what went into the documents and profiles.
+
+The baseline retrieves at cosine ≥ 0.25 (its own floor) and the shipped models at 0.15 (see [Pipeline](#pipeline) for why the floor moved); both lists are in the blended order that selects the pool.
+
+| Metric | Baseline, retrieval | Baseline + rerank | Shipped, retrieval | Shipped + rerank |
+|---|---|---|---|---|
+| MRR | 0.1117 | 0.1656 | 0.1695 | **0.2109** |
+| Recall@5 | 0.1740 | 0.2472 | 0.2847 | **0.3114** |
+| Recall@10 | 0.2286 | 0.3161 | 0.3663 | **0.4191** |
+| Recall@20 | 0.2877 | 0.3870 | 0.4426 | **0.5159** |
+| Recall@50 | 0.3698 | 0.4646 | 0.5201 | **0.6197** |
+| NDCG@10 | 0.1314 | 0.1902 | 0.2058 | **0.2458** |
+| NegHit@10 | — | — | 0.0474 | 0.0987 |
+| NegHit@50 | — | — | 0.1301 | 0.1949 |
+
+The new documents and profiles are worth about a third on every headline metric at the same stage — retrieval alone now beats the baseline's full pipeline — and reranking still earns its place on top of them: +14% Recall@10, +19% NDCG@10, +24% MRR. The baseline has no NegHit because its split held out no negatives.
+
+Disliked games do rank low: 5% of them reach a raw top-10 against 37% of liked ones. The reranker separates them less sharply than retrieval does (10% against 42%), which is the one number here that moves the wrong way; see [Profile sections](#which-profile-sections-matter) for what the `Dislikes` section itself contributes.
+
+**Ordering.** Lists are scored as the page shows them — by relevance — as well as by the blended score that selected them:
+
+| Shipped + rerank | blend order | **relevance order (the page)** |
+|---|---|---|
+| MRR | 0.2109 | 0.2002 |
+| Recall@10 | 0.4191 | 0.4375 |
+| Recall@50 | 0.6197 | 0.6104 |
+| NDCG@10 | 0.2458 | 0.2435 |
+| NegHit@10 | 0.0987 | 0.0565 |
+
+Recall@10 is a little better by relevance and MRR a little worse — the rating term is worth something at the very top — and relevance ordering nearly halves how often a disliked game reaches the top ten. The reasons for ordering by relevance are unchanged (see [The blend](#pipeline)).
+
+An earlier round of these models carried an `Era` section and `Year:` in the documents. Removing both (see [Preparation](#preparation)) moved every user-mode number by less than a point in either direction — Recall@10 0.4294 → 0.4375 by relevance, MRR 0.1988 → 0.2002 — while fixing the item modes outright.
 
 ### Training runs
 
-**Bi-encoder** — 3 epochs, batch 64, ~32 min on an Apple M-series GPU.
+**Bi-encoder** — 3 epochs, batch 64, 18,005 pairs, ~20 min per epoch on an Apple M-series GPU. Validation uses training profiles and is leak-free.
 
-| Epoch | Loss | Val Recall@10 | Val MRR | |
-|---|---|---|---|---|
-| 1 | 3.3233 | 0.1804 | 0.0857 | |
-| 2 | 3.0308 | **0.2084** | **0.0923** | ← saved |
-| 3 | 2.9514 | 0.1971 | 0.0901 | |
+| Epoch | Val Recall@10 | Val MRR | |
+|---|---|---|---|
+| 1 | 0.2957 | 0.1295 | |
+| 2 | 0.3006 | 0.1274 | |
+| 3 | **0.3091** | 0.1299 | ← saved |
 
-Validation peaked at epoch 2 while training loss kept falling, so the script restores the best-validating weights rather than the last — worth +0.0113 Recall@10 here. The winning epoch moves between runs, which is the argument for selecting a checkpoint rather than tuning the epoch count.
+The baseline run on the same data peaked at 0.1963. The best epoch still moves between runs (the previous round peaked at epoch 2), which remains the argument for selecting a checkpoint rather than tuning the epoch count.
 
-**Reranker** — 2 epochs, batch 16, ~24 min. 41,261 examples (17,697 positive, 23,564 negative), final training loss 0.6272.
+**Reranker** — 2 epochs, batch 16, 39,276 examples (18,005 positive, 21,271 negative).
+
+**Item encoder** — 3 epochs, batch 64, 34,289 sampled pairs per epoch, ~16 min per epoch, initialised from the fine-tuned doc encoder. Best epoch 2, val item Recall@10 **0.0759** (the round with `Year:` in the documents peaked at 0.0722). The validation task is the item-to-item one described below, which is far harder than the profile task, so the two Recall columns are not comparable.
 
 ---
 
+## Item-to-item modes
+
+`game` and `author` used to be profile queries in disguise: a game's systems and tags were formatted as though they were a user's profile and put through the query encoder, which had only ever seen aggregates over many games. That can find tag-alike games and nothing else — never "people who loved this also loved that" — and it was never evaluated, because nothing in the data said what a game's neighbours should be.
+
+The co-occurrence tables in the dump say exactly that. Four sources, each a group of games that belong together in someone's mind:
+
+| Source | Sets | Rows | Games | Weight |
+|---|---|---|---|---|
+| A user's liked games | 1,653 | 28,095 | 4,780 | 1.0 |
+| A user's wishlist | 1,412 | 45,813 | 5,654 | 0.5 |
+| Games voted into one poll | 688 | 9,389 | 2,800 | 1.0 |
+| One member's recommended list | 534 | 5,883 | 2,409 | 0.7 |
+
+7,208 of the 10,291 games in the retrieval set appear in at least one; the rest are still embedded from their text, which is the reason for a text tower rather than id embeddings. Every source is keyed by a user — a poll vote and a list have an owner — so the (user, game) pairs held out for validation and testing are dropped from all four before any pair is drawn. Otherwise a user's wishlist could hand the encoder the very pair the evaluation asks it to find.
+
+**Sampling, not enumeration.** A user with 1,500 liked games would supply a million pairs and drown everyone else, so each epoch draws at most `pairs_per_set_cap` (20) random pairs from each set, scaled by the source weight. Symmetric InfoNCE with in-batch negatives, masking the ones that are not negatives — the same game on both sides, or two pairs from one set.
+
+**No reranker.** The cross-encoder was trained on (profile, document) pairs and has nothing to say about two documents; an item-to-item bi-encoder is ordinarily the whole model, and a second cross-encoder would have cost another training run and turned a seconds-long precompute back into hours. It can be added if the numbers ever call for it.
+
+**No `Year:` in the documents.** The first item encoder was trained with it, and its neighbours were the seed's contemporaries and nothing else — the median year gap between a seed and its top 25 was zero, and for a 2020 seed 93% of them were from 2020–21:
+
+| seed year | <2010 | 2010–14 | 2015–17 | 2018–19 | 2020–21 | 2022+ |
+|---|---|---|---|---|---|---|
+| 2016 | 0% | 2% | **96%** | 2% | 0% | 0% |
+| 2019 | 0% | 0% | 1% | **90%** | 8% | 1% |
+| 2020 | 0% | 1% | 0% | 5% | **93%** | 0% |
+| 2023 | 1% | 0% | 0% | 0% | 0% | **99%** |
+
+The data invites it: reviewers rate whole competition cohorts, so co-liked games share a year, and a year token is the cheapest way to say so. The metrics did not object, because a user's held-out positives share that year too — which is a reminder that the item-mode numbers reward "same cohort" as readily as "same taste", and the qualitative check matters. With the token gone the encoder has to find the taste, and period survives only as far as the co-occurrence carries it — a median gap of three to four years, spread smoothly, with 2019 and 2020 seeds drawing near-identical distributions:
+
+| seed year | <2010 | 2010–14 | 2015–17 | 2018–19 | 2020–21 | 2022+ | median gap |
+|---|---|---|---|---|---|---|---|
+| 2016 | 7% | 13% | 31% | 13% | 12% | 25% | 3 |
+| 2019 | 8% | 15% | 17% | 16% | 16% | 28% | 3 |
+| 2020 | 13% | 12% | 16% | 14% | 18% | 28% | 4 |
+| 2023 | 5% | 5% | 8% | 6% | 9% | 67% | 2 |
+
+Photopia still gets *9:05*, *Shade*, *I-0*, *Aisle*, *Galatea* and *Varicella* — its actual contemporaries in taste — while Counterfeit Monkey's neighbours now run from *Savoir-Faire* (2002) to *Never Gives Up Her Dead* (2023). Validation item Recall@10 went *up*, 0.072 to 0.076, on a metric that rewards same-cohort matches.
+
+**Relevance is rescaled cosine.** The space is narrow — random pairs sit at cosine 0.75 and a game's 500th neighbour well above 0.8 — so raw values would read as "everything matches" and a cosine floor would never bite. Relevance is `(cos − baseline) / (1 − baseline)`, clipped to [0, 1], with the baseline — 0.751 for the shipped encoder — measured over random pairs when the index is built. Affine and corpus-wide, so it stays absolute: a first neighbour lands around 0.8, the 500th around 0.4, and a seed with only weak neighbours still looks weak. `min_item_score: 0.30` on that scale leaves a median of ~1,000 candidates, and rarely fewer than 50.
+
+The neighbours read as a person's would. Photopia's are *9:05*, *I-0*, *Shade*, *Galatea*, *Violet* and *For a Change*; Counterfeit Monkey's are *Hadean Lands*, *City of Secrets* and *Savoir-Faire*. The tag route had given Photopia *BYOD [es]*, *Broken* and *A Normal Lost Phone* — games that share its tags and nothing else.
+
+### Evaluating the item modes
+
+Same test split, read the other way round. For each user with test positives, one of their *training* positives is the seed game, and the test positives are what a good "more like this" list should contain. For `author`, the seed is the author of one of the training positives, the author's own games are excluded (as the mode does), and the targets are the user's test positives by anyone else. Seeds are drawn with a fixed generator so every method scores the same queries, and the shipped approach is measured on the same protocol.
+
+**Game mode** (1,742 queries; the reranked baseline on a 300-query sample, with the others re-scored on that sample for a paired comparison):
+
+| | profile | profile + rerank | item encoder |
+|---|---|---|---|
+| Recall@10, same 300 | 0.0458 | 0.0569 | **0.0928** |
+| Recall@25, same 300 | 0.0733 | 0.0853 | **0.1489** |
+| Recall@50, same 300 | 0.0866 | 0.1261 | **0.1861** |
+| MRR, same 300 | 0.0347 | 0.0337 | **0.0637** |
+| Recall@10, all 1,742 | 0.0337 | — | **0.0899** |
+| Recall@50, all 1,742 | 0.0702 | — | **0.2026** |
+
++63% Recall@10 and +75% Recall@25 over the full shipped pipeline, reranker included, and the gap widens with depth — the shape a co-occurrence model should have against a tag-similarity one. Absolute numbers are low because the question is hard: from one seed game, find the specific games this user went on to like, among ten thousand.
+
+**Author mode** (1,629 queries; the reranked baseline on a 300-query sample, with the item methods re-scored on that sample):
+
+| | profile | profile + rerank | item, centroid | item, max |
+|---|---|---|---|---|
+| Recall@10, same 300 | 0.0115 | 0.0214 | **0.0248** | 0.0181 |
+| NDCG@10, same 300 | 0.0078 | 0.0124 | **0.0151** | 0.0131 |
+| Recall@25, same 300 | 0.0270 | 0.0469 | **0.0495** | 0.0384 |
+| Recall@50, same 300 | 0.0414 | **0.0627** | 0.0572 | 0.0689 |
+| MRR, same 300 | 0.0091 | 0.0147 | **0.0171** | 0.0169 |
+| Recall@10, all 1,629 | 0.0149 | — | 0.0261 | **0.0268** |
+| Recall@25, all 1,629 | 0.0271 | — | **0.0578** | 0.0519 |
+| Recall@50, all 1,629 | 0.0406 | — | 0.0762 | **0.0788** |
+
+A smaller and less even win than game mode's: +16% Recall@10 and +22% NDCG@10 over the old route on the paired sample, a tie at 25, and the reranked route ahead at 50. The task is harder — the targets exclude the author's own games, so what is left is "what else did this author's fans like", a step removed from the seed — and an author of one game is a game query in all but name.
+
+Centroid — the author's games averaged into one seed — and max-over-games are close, but centroid is ahead where it matters, the first page (Recall@10 0.0248 against 0.0181 on the paired sample), and max only pulls level at depth; the worry that a centroid blurs an eclectic catalogue did not materialise. `author_merge: centroid` is the default. Single-game authors (4,713 of 6,291) collapse to `game` mode either way.
+
 ## Experiments
+
+### Which profile sections matter
+
+Raw-retrieval ablation over the 1,920 test users: one section stripped from every profile at query time, encoders untouched. That measures what the trained query tower gets from a section, not what a tower trained without it would do — enough to rank them, not to price them exactly. Measured on the first 2026-09 models, which still carried `Era` in profiles and `Year:` in documents; that is why the table has a row the shipped profile no longer has.
+
+| Profile | MRR | Recall@10 | Recall@50 | NDCG@10 | NegHit@10 |
+|---|---|---|---|---|---|
+| full | 0.1715 | 0.3634 | 0.5171 | 0.2063 | 0.0415 |
+| − Authors | 0.0885 | 0.1552 | 0.2809 | 0.0970 | 0.0377 |
+| − Era | 0.1728 | 0.3729 | 0.5253 | 0.2096 | 0.0474 |
+| − Language | 0.1718 | 0.3644 | 0.5172 | 0.2069 | 0.0404 |
+| − Dislikes | 0.1739 | 0.3673 | 0.5263 | 0.2087 | 0.0444 |
+| systems + tags only | 0.0926 | 0.1630 | 0.2911 | 0.1011 | 0.0438 |
+
+**Authors carries the retrieval gain.** Everything else is within noise of the full profile at this stage, and a query tower trained with authors present is lost without them — 0.155, below even the baseline's 0.229, because it was never asked to work from tags alone. The honest reading is that authorship is the strongest taste signal the data has, which matches the 24.5% of test positives that are by an author the user had already liked.
+
+**Era and Language are neutral for the bi-encoder** — removing either even nudges recall up. Language stays: it costs nothing and it is the only way a Spanish-speaking reviewer's profile can say so. Era was removed, for the reasons under [Preparation](#preparation): neutral here, and a cutoff in effect.
+
+**Dislikes are neutral for the bi-encoder, as predicted.** Mean-pooled cosine cannot negate: appending "Dislikes: puzzles" adds the token "puzzles" to the query vector and pulls it toward puzzle games, and fine-tuning did not teach the tower otherwise — NegHit@10 is 0.0415 with the section and 0.0444 without, a difference of two games in a thousand. The section's case rested on the reranker, which attends across both texts — and it does not make it either. With `Dislikes` stripped from every profile, the reranked pipeline scores NegHit@10 0.0906 against 0.0892 with it, Recall@10 0.4260 against 0.4292, MRR 0.2206 against 0.2263: a game or two in a thousand on the negative side, a hair on the positive one. Stripping at query time is a slight mismatch against what the cross-encoder trained on, so this is not a verdict on a reranker trained without the section, but it rules out anything large.
+
+So the dislikes stay in the profile for what they are — an honest line in the query panel about what a reviewer rates low — not for anything they do to the ranking. Moving disliked games down measurably would need something other than more text: a hard demotion at ranking time on the tags in the list, or explicit negatives in the bi-encoder's loss, both untested.
+
+### What the dump does and does not offer
+
+Every table in the 2026-09 dump was looked at before the sections above were chosen. The ones not used, and why:
+
+| Field or table | Coverage | Verdict |
+|---|---|---|
+| `games.forgiveness` | 26%, five real values and ~45 joke ones | Cheap to fold into tags; left out for now |
+| `games.seriesname` | 14% (Eamon 281, Fallen London 111) | Tags carry it; same-series recommendations are either obvious or trivial |
+| `games.license` | 80% | A filter attribute (free/commercial), not taste |
+| `playertimes` | 1,661 games, 360 users | Length matters in IF, coverage is too thin; tags partly cover it |
+| `compgames` (placement) | 4,957 games | A quality signal, already carried by the rating blend |
+| `gametags` (per-user votes) | `games.tags` is exactly its aggregate | Nearly every vote count is one; weights add nothing |
+| `reviews.review` (text) | 7,879 games with a ≥200-character review | The largest untapped signal: descriptions are author blurbs, reviews describe the experience. Deferred — it competes with the 256-token budget, so it means a longer sequence and a slower reranker everywhere |
+| `users.gender` | M 963 / F 365 / unknown 2,572 among raters | Left out: a third covered, steers by demographic rather than taste, and opaque to the reader |
+| `users.location`, `users.profile` | 17% / 720 raters, free text | Too sparse and out of distribution for the encoders |
+| age | not recorded | — |
+| `unwishlists` | 15,158 games, 131 users | One account marks nearly every game; no signal |
 
 ### Depth: how many candidates should the reranker see?
 
@@ -321,7 +512,7 @@ The cap is applied **after** the tag pre-filter in both front-ends. At the same 
 only one the move to ARM made slower — the other three have been table lookups
 since `07_precompute.py` existed. It now has a table too: `precomputed_vibe.
 parquet`, 1,050 keys over the top 5 systems paired with each of the top 20 tags
-and each unordered pair of them, 337k rows, 6 MB, 18 minutes to build.
+and each unordered pair of them, 375k rows, 7 MB, 26 minutes to build.
 
 Deliberately one and two tags, which is the inverse of where the work is. Picks
 of three or more tags are already cheap because `prefilter_tag_matches` requires
@@ -542,14 +733,17 @@ Sized for a CPU-only host such as a free-tier Hugging Face Space (2 vCPU, 16 GB)
 `game`, `author` and `reviewer` draw from fixed key sets, so their rankings are computed once and served as a lookup:
 
 ```bash
-uv run scripts/07_precompute.py --mode all --top-n 500     # ~5 h
+uv run scripts/07_precompute.py --mode all --top-n 500     # ~1.2 h
 ```
+
+Nearly all of that is `reviewer` and `vibe`, the two modes that cross-encode. `game` and `author` are nearest-neighbour lookups now and take about forty seconds between them for 16,700 keys, where they used to take four hours; they are also stored at the full 500 for almost every key, since the item space rarely runs out of candidates above its floor.
 
 | Artefact | Rows | Keys | Median depth | Size |
 |---|---|---|---|---|
-| `precomputed_userid.parquet` | 816,351 | 3,170 | 222 | 14.4 MB |
-| `precomputed_gameid.parquet` | 2,269,909 | 10,076 | 198 | 39.2 MB |
-| `precomputed_authorid.parquet` | 1,436,646 | 6,291 | 202 | 24.0 MB |
+| `precomputed_userid.parquet` | 1,002,138 | 3,242 | 316 | 18.5 MB |
+| `precomputed_gameid.parquet` | 4,246,018 | 10,282 | 500 | 76.5 MB |
+| `precomputed_authorid.parquet` | 2,765,311 | 6,422 | 500 | 47.6 MB |
+| `precomputed_vibe.parquet` | 369,897 | 1,050 | 382 | 6.7 MB |
 
 Rows stream to Parquet in batches and publish by atomic rename, so a reader never sees a half-written file and a failed run cannot destroy the previous artefact. If a file is missing or unreadable, that mode falls back to live scoring — slower, never wrong.
 
@@ -557,11 +751,11 @@ Rows stream to Parquet in batches and publish by atomic rename, so a reader neve
 
 Precompute ignores `rerank_pool_cap` — an offline job has no latency budget to protect, so these tables are built over the whole pool. It does pick up `quantize_reranker` through the shared loader, which on an x86 host halves the run. The tables currently shipped were built fp32; regenerating them under int8 is optional rather than required, since quality is unchanged either way.
 
-Not everything is deep: 3.2% of users, 8.7% of games and 9.1% of authors have fewer than 25 stored results, so a UI should report the true count rather than implying a full page.
+Not everything is deep: 2.9% of users have fewer than 25 stored results (0.5% of games and 0.9% of authors), so a UI should report the true count rather than implying a full page.
 
 ### Resources
 
-**Memory ~1.5 GB** with everything resident — dataframes, FAISS index, embeddings, both models and all three lookup tables.
+**Memory ~1.7 GB** with everything resident — dataframes, both FAISS indexes, embeddings, all three encoders and the reranker, and the four lookup tables. The item encoder and its index add about 120 MB.
 
 **CPU is the real constraint**, and it is worth measuring rather than estimating: an Apple M-series laptop runs the cross-encoder at ~145 pairs/s on two threads, while the 2-vCPU OCI instance runs it at 45 — a 3.2× gap that no amount of reasoning about "a free-tier vCPU" would have pinned down. `scripts/measure_latency.py` reports it for a given host. That budget is fixed and shared, so concurrent requests divide it. Serialising inference (`concurrency_limit=1`) makes contention a visible queue rather than everyone slowing down at once.
 
@@ -587,6 +781,8 @@ The number worth watching in production is neither the cache nor the models: PyT
 ## Possible extensions
 
 - **Larger base models** — `all-mpnet-base-v2` for retrieval, DeBERTa-v3 for reranking. Better quality, worse latency, which matters for a lightweight deployment but could be useful in situations where everything would be precomputed.
+- **Review text in the documents** — 7,879 games have a substantial review; the description is the author's pitch, a review is what playing it was like. Needs a longer `max_seq_length`, so it is a measured trade rather than a free addition.
+- **A longer item-encoder run** — validation was still rising at the third epoch, and a second cross-encoder over (document, document) pairs is the natural next step if the item modes ever need one.
 - **Session-based profiles** — a sliding window over recent positive ratings rather than a full-history aggregate.
 - **Faster bi-encoder training** — wall time is dominated by the training epochs (6–16 min each), not the validation passes (15–50 s). Gains would come from larger batches or mixed precision.
 - **Author identity** — `gameprofilelinks` maps games to IFDB user accounts, covering 38.5% of games. Too sparse to key author search on, but enough to deep-link authors to their profiles and to merge pen names that name matching cannot.
