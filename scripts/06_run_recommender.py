@@ -26,11 +26,12 @@ Usage
 """
 
 import argparse
+import copy
 import logging
 import pickle
 import sys
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -45,12 +46,14 @@ from sentence_transformers import SentenceTransformer, CrossEncoder
 
 from src.index.faiss_index import GameIndex
 from src.pipeline.retriever import Retriever
+from src.pipeline.items import ItemSpace
 from src.data.preprocessor import (
     SYSTEM_GENRE_SEPARATORS, TAG_SEPARATORS,
     build_author_profiles, build_display_map, clean_description, clean_frequencies,
     clean_language, drop_non_games, format_display, format_profile_text,
     strip_placeholder_systems,
-    author_game_map, parse_profile_text, profile_display,
+    author_game_map, parse_profile_text, parse_profile_sections, profile_display,
+    PROFILE_SECTIONS,
 )
 from src.data.pickers import (
     author_choices, game_choices, reviewer_choices, vocab_choices,
@@ -469,6 +472,7 @@ def load_artefacts(cfg: dict):
         game_query_embeddings=game_query_embeddings,
     )
     retriever.bi_encoder = query_encoder
+    retriever.items = ItemSpace.load(index_dir)
 
     # Prefer fine-tuned reranker; fall back to base cross-encoder model
     reranker_dir = base_dir / "reranker"
@@ -753,11 +757,29 @@ def run_interactive(
                       "game": precomputed_game,
                       "author": precomputed_author}[mode].get(key)
 
+        item_seeds = None
+        if mode == "game":
+            item_seeds = [key]
+        elif mode == "author":
+            item_seeds = author_games.get(key, [])
+
         if cached is not None:
             gids, scores, rels = cached
             scored = list(zip(gids, scores))
             relevance = dict(zip(gids, rels))
             logger.info("Precomputed ranking (%d entries) — no scoring needed", len(gids))
+        elif item_seeds and retriever.items is not None:
+            # Nearest neighbours in the item space; no reranker (see items.py).
+            scored, relevance = retriever.rank_items(
+                item_seeds, exclude=seen_games, merge=retr_cfg.get("author_merge", "centroid"),
+                min_score=retr_cfg.get("min_item_score", 0.0),
+                bayesian_avg_map=bayesian_avg_map, rating_weight=rating_w,
+                allowed=set(game_info_map) if game_info_map is not None else None,
+            )
+            logger.info("Item-space ranking from %d seed(s): %d results", len(item_seeds), len(scored))
+            if not scored:
+                print("  nothing in the item space for that seed.\n")
+                continue
         else:
             # Retrieve every candidate above the cosine threshold, then score the
             # whole pool with the cross-encoder exactly once. Cosine rank and
@@ -860,12 +882,42 @@ def run_evaluation(
     profile_map=None,
     bayesian_avg_map=None,
     rerank: bool = False,
+    profiles: str = "train",
+    strip_sections: Tuple[str, ...] = (),
 ) -> None:
     data_dir   = Path(cfg["paths"]["data_dir"])
     retr_cfg   = cfg["retrieval"]
     top_k_ret  = retr_cfg["top_k_retrieve"]
     min_score  = retr_cfg.get("min_retrieval_score", 0.25)
     profile_map = profile_map or {}
+
+    # The serving profiles (user_profiles_retrieval.parquet) are built from
+    # every rating a user made — including the test positives being looked
+    # for. Evaluating with them leaks: the held-out game's tags, and now its
+    # author, sit in the query. Training profiles are built from the train
+    # split alone, so they are what an honest number needs; the retrieval
+    # profiles are kept as an option only to reproduce the older figures.
+    if profiles == "train":
+        train_profiles = pd.read_parquet(data_dir / "user_profiles.parquet")
+        profile_map = dict(zip(train_profiles["userid"], train_profiles["profile_text"]))
+        retriever = copy.copy(retriever)
+        retriever.user_profiles = profile_map
+        logger.info("Evaluating with training profiles (%d users)", len(profile_map))
+    if strip_sections:
+        # Ablation: drop sections from the query text without retraining, so
+        # the number says what the trained models get from that section.
+        drop = set(strip_sections)
+        profile_map = {
+            uid: format_profile_text(*[[] if label in drop else secs.get(label, [])
+                                       for label in PROFILE_SECTIONS])
+            for uid, secs in ((u, parse_profile_sections(t)) for u, t in profile_map.items())
+        }
+        retriever = copy.copy(retriever)
+        retriever.user_profiles = profile_map
+        logger.info("Stripped %s from every profile", ", ".join(sorted(drop)))
+    else:
+        logger.warning("Evaluating with retrieval profiles — these include the test "
+                       "positives' own tags and authors, so the numbers are inflated")
 
     logger.info("Loading test interactions …")
     interactions = pd.read_parquet(data_dir / "interactions.parquet")
@@ -876,10 +928,19 @@ def run_evaluation(
     ground_truth: Dict[str, set] = (
         test_pos.groupby("userid")["gameid"].apply(set).to_dict()
     )
+    # Held-out negatives: games the user rated *below* the game's average.
+    # These should rank low, so their hit rate is reported beside recall.
+    test_neg = interactions[
+        (interactions["split"] == "test") & (interactions["label"] == 0)
+    ]
+    negatives: Dict[str, set] = (
+        test_neg.groupby("userid")["gameid"].apply(set).to_dict()
+    )
 
     mode = "retrieval + reranking" if rerank else "raw retrieval"
     logger.info("Running %s for %d test users …", mode, len(ground_truth))
     predictions: Dict[str, List[str]] = {}
+    by_relevance: Dict[str, List[str]] = {}
     n_skipped = 0
     for n, uid in enumerate(ground_truth, start=1):
         emb = retriever._encode_userid(uid)
@@ -894,7 +955,7 @@ def run_evaluation(
             # protect. The cap exists for `vibe`, the only mode scored live, so
             # applying it here would measure something nobody is served.
             candidates = retriever.index.search(emb, min_score=min_score)
-            scored, _ = reranker.rerank(
+            scored, relevance = reranker.rerank(
                 query_text=profile_map.get(uid, ""),
                 candidates=candidates,
                 game_doc_lookup=doc_map,
@@ -904,6 +965,8 @@ def run_evaluation(
                 min_ce_score=retr_cfg.get("min_rerank_score", 0.25),
             )
             predictions[uid] = [gid for gid, _ in scored]
+            # The page orders by relevance alone, so that ordering is scored too.
+            by_relevance[uid] = [gid for gid, _ in order_by_relevance(scored, relevance)]
         else:
             candidates = retriever.index.search(emb, top_k=top_k_ret)
             predictions[uid] = [gid for gid, _ in candidates]
@@ -919,12 +982,45 @@ def run_evaluation(
         ks=(1, 5, 10, 20, 50),
     )
 
-    print("\n" + "=" * 50)
-    print(f"  Evaluation results (test split, {mode})")
-    print("=" * 50)
-    for metric, value in sorted(results.items()):
-        print(f"  {metric:<15}  {value:.4f}")
-    print()
+    def _print(title: str, preds: Dict[str, List[str]], res: Dict[str, float]) -> None:
+        print("\n" + "=" * 50)
+        print(f"  {title}")
+        print("=" * 50)
+        for metric, value in sorted(res.items()):
+            print(f"  {metric:<15}  {value:.4f}")
+        neg_results = evaluate_negatives(preds, negatives, ks=(10, 50))
+        if neg_results:
+            print(f"  -- held-out negatives ({neg_results.pop('users')} users): "
+                  "share of disliked games appearing in the top K (lower is better)")
+            for metric, value in sorted(neg_results.items()):
+                print(f"  {metric:<15}  {value:.4f}")
+        print()
+
+    stripped = f", without {'/'.join(strip_sections)}" if strip_sections else ""
+    _print(f"Evaluation results (test split, {mode}, {profiles} profiles{stripped})", predictions, results)
+    if by_relevance:
+        _print(f"Same lists ordered by relevance alone, as the page shows them",
+               by_relevance, evaluate_retrieval(by_relevance, ground_truth, ks=(1, 5, 10, 20, 50)))
+
+
+def evaluate_negatives(predictions: Dict[str, List[str]],
+                       negatives: Dict[str, set], ks=(10, 50)) -> Dict[str, float]:
+    """
+    NegHit@K: the fraction of a user's held-out disliked games in their top K,
+    averaged over users who have both a prediction list and held-out negatives.
+    The positive Recall@K at the same K is the natural comparison: a model that
+    tells the two apart puts positives in the top K far more often than
+    negatives.
+    """
+    users = [u for u in negatives if u in predictions]
+    if not users:
+        return {}
+    out: Dict[str, float] = {"users": len(users)}
+    for k in ks:
+        out[f"NegHit@{k}"] = float(np.mean([
+            len(set(predictions[u][:k]) & negatives[u]) / len(negatives[u]) for u in users
+        ]))
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -939,6 +1035,12 @@ def main() -> None:
     parser.add_argument("--rerank", action="store_true",
                         help="Evaluate mode: score candidates with the reranker, "
                              "as the interactive pipeline does (slower)")
+    parser.add_argument("--profiles", choices=["train", "retrieval"], default="train",
+                        help="Evaluate mode: which profiles to query with. 'retrieval' "
+                             "profiles include the test positives and inflate the numbers")
+    parser.add_argument("--strip-sections", default="",
+                        help="Evaluate mode: comma-separated profile sections to drop at "
+                             "query time (e.g. Dislikes), as an ablation")
     args = parser.parse_args()
 
     with open(args.config) as f:
@@ -978,6 +1080,8 @@ def main() -> None:
             retriever, game_docs, doc_map, cfg,
             reranker=reranker, profile_map=profile_map,
             bayesian_avg_map=bayesian_avg_map, rerank=args.rerank,
+            profiles=args.profiles,
+            strip_sections=tuple(x for x in args.strip_sections.split(",") if x),
         )
 
 

@@ -25,6 +25,7 @@ Usage
 """
 
 import argparse
+import json
 import logging
 import pickle
 import sys
@@ -41,6 +42,7 @@ from src.utils.env import configure_logging
 configure_logging()
 
 from src.index.faiss_index import GameIndex
+from src.pipeline.items import ITEM_EMBS_FILE, ITEM_INDEX_DIR, ITEM_SCALE_FILE, random_pair_baseline
 
 logger = logging.getLogger(__name__)
 
@@ -147,6 +149,33 @@ def main() -> None:
         logger.info("Saved game_query_embs.npy (shape %s)", query_embeddings.shape)
     else:
         logger.warning("game_docs has no 'query_text' column; skipping game_query_embs.npy")
+
+    # ------------------------------------------------------------------ #
+    # Item encoder → item index + embeddings, for game and author modes
+    # ------------------------------------------------------------------ #
+    item_encoder_dir = base_model_dir / "item_encoder"
+    if item_encoder_dir.exists():
+        logger.info("Loading item encoder from %s …", item_encoder_dir)
+        item_model = SentenceTransformer(str(item_encoder_dir))
+        item_model.max_seq_length = model_cfg["max_seq_length"]
+        logger.info("Encoding game documents with the item encoder …")
+        item_embs = item_model.encode(
+            doc_texts, batch_size=128, normalize_embeddings=True,
+            show_progress_bar=True, convert_to_numpy=True,
+        ).astype(np.float32)
+        np.save(index_dir / ITEM_EMBS_FILE, item_embs)
+        item_index = GameIndex()
+        item_index.build(item_embs, game_ids, index_type=index_type, hnsw_m=hnsw_m)
+        item_index.save(index_dir / ITEM_INDEX_DIR)
+        # The level an unrelated pair sits at, for rescaling cosine to a
+        # readable relevance (see src/pipeline/items.py).
+        baseline = random_pair_baseline(item_embs)
+        (index_dir / ITEM_SCALE_FILE).write_text(json.dumps({"baseline": round(baseline, 4)}) + "\n")
+        logger.info("Saved %s, %s/ and %s (random-pair baseline %.3f)",
+                    ITEM_EMBS_FILE, ITEM_INDEX_DIR, ITEM_SCALE_FILE, baseline)
+    else:
+        logger.warning("No item encoder at %s; game and author modes will use "
+                       "profile queries (run 03b_train_item_encoder.py)", item_encoder_dir)
 
     logger.info("✓ Index built and saved to %s", index_dir)
 

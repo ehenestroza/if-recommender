@@ -15,35 +15,44 @@ logger = logging.getLogger(__name__)
 
 # MySQL table name → parquet filename
 TABLES: dict[str, str] = {
-    "games":       "games.parquet",
-    "reviews":     "reviews.parquet",
-    "users":       "users.parquet",
-    "playedgames": "playedgames.parquet",
+    "games":        "games.parquet",
+    "reviews":      "reviews.parquet",
+    "users":        "users.parquet",
+    "playedgames":  "playedgames.parquet",
+    # Co-occurrence sources for the item-to-item encoder: a user's wishlist, the
+    # games voted into a poll ("Best short games"), and a member's recommended
+    # list each group games that belong together in someone's mind.
+    "wishlists":    "wishlists.parquet",
+    "polls":        "polls.parquet",
+    "pollvotes":    "pollvotes.parquet",
+    "reclists":     "reclists.parquet",
+    "reclistitems": "reclistitems.parquet",
+    # Explicit item-to-item links — too few to train on (a few hundred), kept
+    # as a sanity-check set for the item encoder.
+    "crossrecs":    "crossrecs.parquet",
+    "gamexrefs":    "gamexrefs.parquet",
+    "gamexreftypes": "gamexreftypes.parquet",
 }
 
-# IFDB uses "ifid" as the game primary key in some dumps; normalise to "gameid".
-_GAME_ID_ALIASES = ("ifid", "id")
+# IFDB names each table's primary key `id`, which collides across tables once
+# more than one is loaded; every key is renamed to say which table it belongs
+# to. `games` is listed with the `ifid` alias some dumps use. A rename applies
+# only when the source column exists and the target does not.
+_RENAMES: dict[str, dict[str, str]] = {
+    "games":     {"ifid": "gameid", "id": "gameid"},
+    "users":     {"id": "userid"},
+    "reviews":   {"id": "reviewid"},
+    "reclists":  {"id": "listid"},
+    "crossrecs": {"id": "crossrecid"},
+}
 
 
-def _normalise_game_id(df: pd.DataFrame) -> pd.DataFrame:
-    """Rename the game-ID column to 'gameid' if it isn't already."""
-    if "gameid" in df.columns:
-        return df
-    for alias in _GAME_ID_ALIASES:
-        if alias in df.columns:
-            df = df.rename(columns={alias: "gameid"})
-            logger.debug("Renamed column '%s' → 'gameid'", alias)
-            return df
-    return df
-
-
-def _normalise_user_id(df: pd.DataFrame) -> pd.DataFrame:
-    """Rename the user primary-key column to 'userid' if it isn't already."""
-    if "userid" in df.columns:
-        return df
-    if "id" in df.columns:
-        df = df.rename(columns={"id": "userid"})
-        logger.debug("Renamed column 'id' → 'userid'")
+def _rename_keys(df: pd.DataFrame, table: str) -> pd.DataFrame:
+    """Give the table's primary key its table-specific name."""
+    for source, target in _RENAMES.get(table, {}).items():
+        if source in df.columns and target not in df.columns:
+            df = df.rename(columns={source: target})
+            logger.debug("%s: renamed column '%s' → '%s'", table, source, target)
     return df
 
 
@@ -108,13 +117,7 @@ def extract_table(
         logger.warning("  Could not fetch '%s': %s", table, exc)
         return
 
-    if table == "users":
-        df = _normalise_user_id(df)
-    elif table == "playedgames":
-        df = _normalise_game_id(df)
-        df = _normalise_user_id(df)
-    else:
-        df = _normalise_game_id(df)
+    df = _rename_keys(df, table)
     df = _coerce_object_columns(df)
     _write_parquet(df, dest)
     logger.info("  Saved %s  (%d rows)", dest.name, len(df))

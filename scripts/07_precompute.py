@@ -242,6 +242,17 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     cfg_r = cfg["retrieval"]
     top_n = args.top_n
+    allowed = set(game_info_map) if game_info_map is not None else None
+
+    def _rank_items(seeds, exclude):
+        """Item-space ranking, ordered by relevance (cosine) as a page is."""
+        scored, relevance = retriever.rank_items(
+            seeds, exclude=exclude, merge=cfg_r.get("author_merge", "centroid"),
+            min_score=cfg_r.get("min_item_score", 0.0), top_n=top_n,
+            bayesian_avg_map=bayesian_avg_map,
+            rating_weight=cfg_r.get("rating_weight", 0.5), allowed=allowed,
+        )
+        return [(g, float(s), float(relevance[g])) for g, s in scored]
 
     if args.mode in ("userid", "all"):
         users = list(profile_map)
@@ -305,13 +316,18 @@ def main() -> None:
         # Key column is named separately from the ranked `gameid` it points to.
         writer, t0 = _ChunkWriter(out_dir / GAMEID_FILE, "seed_gameid"), time.time()
         for i, gid in enumerate(games, 1):
-            emb = retriever._encode_game_ids([gid])
-            if emb is None:
-                continue
-            query_text = game_query_text_map.get(gid, doc_map.get(gid, ""))
-            ranked = _rank_one(emb, {gid}, retriever, reranker, doc_map, cfg_r,
-                               bayesian_avg_map, query_text, top_n,
-                               game_info_map)
+            if retriever.items is not None:
+                # Nearest neighbours in the item space, no reranker. Seconds
+                # rather than hours, since nothing is cross-encoded.
+                ranked = _rank_items([gid], {gid})
+            else:
+                emb = retriever._encode_game_ids([gid])
+                if emb is None:
+                    continue
+                query_text = game_query_text_map.get(gid, doc_map.get(gid, ""))
+                ranked = _rank_one(emb, {gid}, retriever, reranker, doc_map, cfg_r,
+                                   bayesian_avg_map, query_text, top_n,
+                                   game_info_map)
             writer.add([(gid, g, s, r, n) for n, (g, s, r) in enumerate(ranked, 1)])
             if i % 200 == 0:
                 rate = i / (time.time() - t0)
@@ -327,11 +343,15 @@ def main() -> None:
         logger.info("Precomputing %d author_id rankings (top %d each) …", len(profiles), top_n)
         writer, t0 = _ChunkWriter(out_dir / AUTHORID_FILE, "authorid"), time.time()
         for i, row in enumerate(profiles.itertuples(index=False), 1):
-            emb = retriever._encode_text(row.profile_text)
             # Suppress the author's own catalogue, as game_id suppresses its seed.
-            ranked = _rank_one(emb, set(by_author.get(row.authorid, [])), retriever,
-                               reranker, doc_map, cfg_r, bayesian_avg_map,
-                               row.profile_text, top_n, game_info_map)
+            own = set(by_author.get(row.authorid, []))
+            if retriever.items is not None:
+                ranked = _rank_items(list(own), own)
+            else:
+                emb = retriever._encode_text(row.profile_text)
+                ranked = _rank_one(emb, own, retriever, reranker, doc_map, cfg_r,
+                                   bayesian_avg_map, row.profile_text, top_n,
+                                   game_info_map)
             writer.add([(row.authorid, g, s, r, n) for n, (g, s, r) in enumerate(ranked, 1)])
             if i % 200 == 0:
                 rate = i / (time.time() - t0)

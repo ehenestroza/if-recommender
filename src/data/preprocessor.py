@@ -21,7 +21,22 @@ _COMP_RE = re.compile(
 _MAX_TAGS = 20
 
 
-def format_profile_text(systems: List[str], tags: List[str]) -> str:
+# Profile sections, in the order they are written. `Systems` and `Tags` are
+# the original two; the rest were added with the 2026-09 dump. `parse_profile_
+# sections` finds them by label, so the order matters only for the encoders.
+# `Era` is parsed for compatibility but no longer written: see
+# build_user_profiles for why period is a filter, not a section.
+PROFILE_SECTIONS = ("Systems", "Tags", "Authors", "Era", "Language", "Dislikes")
+
+
+def format_profile_text(
+    systems: List[str],
+    tags: List[str],
+    authors: Optional[List[str]] = None,
+    eras: Optional[List[str]] = None,
+    languages: Optional[List[str]] = None,
+    dislikes: Optional[List[str]] = None,
+) -> str:
     """
     Build the query string the encoders were trained on.
 
@@ -29,16 +44,19 @@ def format_profile_text(systems: List[str], tags: List[str]) -> str:
     from a UI's system/tag pickers — must use this exact shape, so it lives in one
     place rather than being re-spelled at each call site:
 
-        "Systems: twine, ink. Tags: fantasy, horror"
+        "Systems: twine, ink. Tags: fantasy, horror. Authors: emily short.
+         Era: 2010s. Language: spanish. Dislikes: puzzles, parser"
 
+    Only the sections with values are written, so a vibe pick made of systems
+    and tags comes out exactly as it did before the later sections existed.
     Values should be the normalised `_clean` forms; IFDB's own casing
     ("Inform 7", "IFComp 2019") is not what the encoders saw during training.
     """
+    values = (systems, tags, authors, eras, languages, dislikes)
     parts: List[str] = []
-    if systems:
-        parts.append(f"Systems: {', '.join(systems)}")
-    if tags:
-        parts.append(f"Tags: {', '.join(tags)}")
+    for label, items in zip(PROFILE_SECTIONS, values):
+        if items:
+            parts.append(f"{label}: {', '.join(items)}")
     return ". ".join(parts)
 
 
@@ -348,17 +366,35 @@ def canonical_vibe(systems, tags, system_rank=None, tag_rank=None):
     return ordered_systems, ordered_tags
 
 
+_SECTION_RE = re.compile(
+    r"(?:^|\.\s+)(" + "|".join(PROFILE_SECTIONS) + r"):\s*"
+)
+
+
+def parse_profile_sections(text: str) -> Dict[str, List[str]]:
+    """
+    Inverse of `format_profile_text` — every section of a query, by label.
+
+    Sections are located by their labels rather than by splitting on ". ",
+    because author names carry periods of their own ("jennifer s. lange") and
+    would otherwise be cut in half. A label counts only at the start of the
+    text or after a sentence break, so a tag like "era: victorian" inside a
+    list is not mistaken for the Era section.
+    """
+    text = str(text or "")
+    matches = list(_SECTION_RE.finditer(text))
+    sections: Dict[str, List[str]] = {}
+    for i, m in enumerate(matches):
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+        body = text[m.end():end].strip().rstrip(".")
+        sections[m.group(1)] = [v.strip() for v in body.split(",") if v.strip()]
+    return sections
+
+
 def parse_profile_text(text: str) -> Tuple[List[str], List[str]]:
     """Inverse of `format_profile_text` — recover (systems, tags) from a query."""
-    systems: List[str] = []
-    tags: List[str] = []
-    for part in str(text).split(". "):
-        part = part.strip()
-        if part.startswith("Systems:"):
-            systems = [v.strip() for v in part[len("Systems:"):].split(",") if v.strip()]
-        elif part.startswith("Tags:"):
-            tags = [v.strip() for v in part[len("Tags:"):].split(",") if v.strip()]
-    return systems, tags
+    sections = parse_profile_sections(text)
+    return sections.get("Systems", []), sections.get("Tags", [])
 
 
 def clean_frequencies(game_docs: pd.DataFrame, column: str) -> Counter:
@@ -392,13 +428,19 @@ def profile_display(
       game / vibe        – no such history to count, so corpus order, matching
                            how the results table orders its own columns.
     """
-    systems, tags = parse_profile_text(query_text)
+    sections = parse_profile_sections(query_text)
+    systems, tags = sections.get("Systems", []), sections.get("Tags", [])
     if system_freq is not None:
         systems = sorted(systems, key=lambda v: (-system_freq.get(v, 0), v))
     if tag_freq is not None:
         tags = sorted(tags, key=lambda v: (-tag_freq.get(v, 0), v))
-    left, right = ", ".join(systems), ", ".join(tags)
-    return f"{left} // {right}" if left and right else (left or right)
+    parts = [", ".join(systems), ", ".join(tags)]
+    # The later sections are short and already lowercase; they read fine as
+    # labelled tails, and the dislikes need the label to make sense at all.
+    for label in ("Authors", "Era", "Language", "Dislikes"):
+        if sections.get(label):
+            parts.append(f"{label.lower()}: {', '.join(sections[label])}")
+    return " // ".join(part for part in parts if part)
 
 
 def profile_vocabulary(
@@ -488,20 +530,32 @@ def build_game_documents(
     untouched beside them, so the interactive system can show exactly what
     ifdb.org shows while the encoders see the normalised text:
 
-      author  → author_clean   split on ',' '/' 'and', deduplicated, rejoined
-      system  → system_clean   parentheticals and version numbers stripped, lowercased
-      tags    → tags_clean     genre folded in, competition tags dropped, capped at 20
+      author   → author_clean    split on ',' '/' 'and', deduplicated, rejoined
+      system   → system_clean    parentheticals and version numbers stripped, lowercased
+      tags     → tags_clean      genre folded in, competition tags dropped, capped at 20
+      language → language_clean  ISO codes and variants resolved to lowercase names
 
     `genre` has no `_clean` variant: its values are folded into tags_clean.
-    `year` is extracted from the original `published` timestamp for range filters.
-    A Bayesian-smoothed rating is included as a quality signal.
+    `year` is extracted from the original `published` timestamp for range
+    filters and display only. It is deliberately *not* written into the
+    document: with `Year:` in the text the item encoder learned to match the
+    year and little else — reviewers rate whole competition cohorts, so
+    co-liked games share a year, and the token is the easiest way to say so.
+    The median year gap between a seed and its neighbours was zero. The
+    language is written in; it is a taste axis the tags do not carry. A
+    Bayesian-smoothed rating is included as a quality signal.
+
+    Tags are ordered by how many games carry each before the cap is applied, so
+    a game with fifty tags keeps the ones a profile can actually contain rather
+    than whichever twenty IFDB happened to store first. Genre values stay in
+    front: they were set deliberately rather than voted in.
 
     Only includes games where title, author, and desc are all non-empty and
     that have received at least min_reviews ratings.
     """
     docs = games.copy()
 
-    for col in ("tags", "desc", "genre", "system", "title", "author", "published"):
+    for col in ("tags", "desc", "genre", "system", "title", "author", "published", "language"):
         if col not in docs.columns:
             docs[col] = ""
         else:
@@ -554,15 +608,27 @@ def build_game_documents(
     else:
         docs["year"] = ""
 
+    docs[clean_col("language")] = docs["language"].apply(
+        lambda l: clean_language(l).lower()
+    )
+
     # Fold genre into tags: genre values are prepended (bypassing the competition
-    # filter since they are explicitly set) then combined with filtered tag values.
-    def _merge_genre_tags(row: pd.Series) -> str:
-        genre_vals = _split_genre(str(row["genre"]))   # lowercased, clean
-        tag_vals   = _filter_tags(str(row["tags"]))    # filtered, lowercased, deduped
+    # filter since they are explicitly set) then combined with filtered tag
+    # values, which are ordered by corpus frequency before the cap.
+    filtered_tags = docs["tags"].apply(lambda t: _filter_tags(str(t)))
+    tag_freq: Counter = Counter()
+    for tags in filtered_tags:
+        tag_freq.update(tags)
+
+    def _merge_genre_tags(genre_str: str, tag_vals: List[str]) -> str:
+        genre_vals = _split_genre(genre_str)            # lowercased, clean
+        tag_vals   = sorted(tag_vals, key=lambda t: -tag_freq[t])   # stable: ties keep IFDB order
         combined   = _dedupe_ordered(genre_vals + tag_vals)[:_MAX_TAGS]
         return ", ".join(combined)
 
-    docs[clean_col("tags")] = docs.apply(_merge_genre_tags, axis=1)
+    docs[clean_col("tags")] = [
+        _merge_genre_tags(str(g), t) for g, t in zip(docs["genre"], filtered_tags)
+    ]
 
     # Encoder inputs are built from the normalised columns only.
     def _make_doc(row: pd.Series) -> str:
@@ -571,6 +637,9 @@ def build_game_documents(
             parts.append(f"Systems: {row[clean_col('system')]}")
         if str(row[clean_col("tags")]).strip():
             parts.append(f"Tags: {row[clean_col('tags')]}")
+        # Ahead of the description, which is what the 256-token limit truncates.
+        if str(row[clean_col("language")]).strip():
+            parts.append(f"Language: {row[clean_col('language')]}")
         snippet = str(row["desc"])[:500].strip()
         if snippet:
             parts.append(f"Description: {snippet}")
@@ -587,9 +656,9 @@ def build_game_documents(
 
     keep = ["gameid", "title",
             # IFDB originals — what the interactive system displays
-            "author", "genre", "system", "tags", "published", "year",
+            "author", "genre", "system", "tags", "published", "year", "language",
             # normalised variants — what the models and filters consume
-            clean_col("author"), clean_col("system"), clean_col("tags"),
+            clean_col("author"), clean_col("system"), clean_col("tags"), clean_col("language"),
             "avg_rating", "bayesian_avg", "review_count", "doc_text", "query_text"]
     return docs[keep].reset_index(drop=True)
 
@@ -665,6 +734,7 @@ def split_interactions(
     val_frac: float = 0.1,
     test_frac: float = 0.1,
     random_state: int = 42,
+    min_neg_holdout: int = 3,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
     Split interactions per-user so every user appears in all three partitions.
@@ -673,7 +743,9 @@ def split_interactions(
       - 1 positive guaranteed to train (for profile building)
       - remaining positives split into test (~test_frac) and val (~val_frac)
       - users with only 1 positive keep it in train and are skipped in eval
-      - all negative interactions go to train (used only for training signal)
+      - negatives: users with at least `min_neg_holdout` hold ~test_frac of
+        them (at least one) out as test rows with label=0, so an evaluation
+        can check that disliked games rank *low*; the rest train
 
     Returns (train, val, test).
     """
@@ -717,7 +789,12 @@ def split_interactions(
             test_rows.append(pos.iloc[n_train + n_val :])
             n_users_with_test += 1
 
-        train_rows.append(neg)  # all negatives go to train
+        if len(neg) >= min_neg_holdout:
+            neg = neg.iloc[rng.permutation(len(neg))]
+            n_neg_test = max(1, round(len(neg) * test_frac))
+            test_rows.append(neg.iloc[:n_neg_test])
+            neg = neg.iloc[n_neg_test:]
+        train_rows.append(neg)
 
     def _concat(rows: List[pd.DataFrame]) -> pd.DataFrame:
         if rows:
@@ -730,8 +807,9 @@ def split_interactions(
 
     n_total = interactions["userid"].nunique()
     logger.info(
-        "Split: %d users total / %d with test items / %d val items / %d test items",
-        n_total, n_users_with_test, len(val), len(test),
+        "Split: %d users total / %d with test items / %d val items / %d test positives / %d test negatives",
+        n_total, n_users_with_test, len(val),
+        int((test["label"] == 1).sum()), int((test["label"] == 0).sum()),
     )
     return train, val, test
 
@@ -739,6 +817,55 @@ def split_interactions(
 # ---------------------------------------------------------------------------
 # User profiles
 # ---------------------------------------------------------------------------
+
+# How much of a user's liked set a language needs before it is
+# written into the profile, and how many games at least: one multi-language
+# game in a set of four would otherwise put three languages on the profile.
+_PROFILE_SHARE = 0.25
+_PROFILE_MIN_GAMES = 2
+_MAX_AUTHORS = 5
+# Author values that name nobody. Matching on them would pair every anonymous
+# game with every other.
+_NON_AUTHORS = {"anonymous", "unknown", "various", "n/a", "none"}
+_MAX_DISLIKES = 10
+
+
+def _split_values(raw) -> List[str]:
+    return [v.strip() for v in str(raw or "").split(",") if v.strip()]
+
+
+def disliked_values(
+    liked: List[List[str]],
+    disliked: List[List[str]],
+    exclude: set,
+    min_count: int = 2,
+    limit: int = _MAX_DISLIKES,
+) -> List[str]:
+    """
+    Values that mark a user's disliked games out from their liked ones.
+
+    Each inner list holds one game's values. A value qualifies when at least
+    `min_count` disliked games carry it and it is commoner among the disliked
+    games than among the liked ones — the mirror image of "top tags" would
+    list whatever most games have ("parser", "fantasy"), since a disliked game
+    carries the same ordinary tags a liked one does. Ranked by how much more
+    common the value is among dislikes; values in `exclude` (the liked list)
+    never appear, so a profile cannot both like and dislike a tag.
+    """
+    if not disliked:
+        return []
+    n_liked, n_dis = max(len(liked), 1), len(disliked)
+    liked_counts: Counter = Counter(v for vals in liked for v in set(vals))
+    dis_counts: Counter = Counter(v for vals in disliked for v in set(vals))
+    scored = []
+    for value, count in dis_counts.items():
+        if count < min_count or value in exclude:
+            continue
+        gap = count / n_dis - liked_counts[value] / n_liked
+        if gap > 0:
+            scored.append((-gap, -count, value))
+    return [value for _, _, value in sorted(scored)[:limit]]
+
 
 def build_user_profiles(
     interactions: pd.DataFrame,
@@ -748,18 +875,30 @@ def build_user_profiles(
     users: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
     """
-    Build a text profile for each user from their positively-rated games.
+    Build a text profile for each user from the games they rated.
 
-    Profile text aggregates top system and tag values (tags include genre values
-    since genre is folded into tags during game document building) from:
+    The liked set is the union of:
       1. Games the user rated positively in the interaction matrix (label=1)
       2. Games the user gave an absolute rating >= min_absolute_rating (if reviews provided)
 
-    Profile format: "Systems: Z. Tags: a, b, c."
+    From it come the top systems and tags (tags include genre values, folded in
+    during game document building), the authors liked most often, and the
+    languages that make up a real share of the set. Not the decades: an `Era`
+    section measured neutral for retrieval and, with `Year:` in the documents,
+    turned period into a cutoff — the difference between 2019 and 2020 is
+    smaller than between 2010 and 2019, and a decade token cannot say so. The
+    year filter is where a period preference belongs. The disliked set —
+    label=0 interactions, if the frame carries any — supplies a `Dislikes`
+    section of the systems and tags that distinguish it from the liked set;
+    see `disliked_values`. English is written only when another language also
+    qualifies: on its own it is a constant token that says nothing.
+
+    Profile format: "Systems: … Tags: … Authors: … Language: … Dislikes: …"
     Returns columns: userid, name, profile_text.
     """
     # Build game_id sets per user from training positives (label=1)
     pos = interactions[interactions["label"] == 1][["userid", "gameid"]]
+    neg = interactions[interactions["label"] == 0][["userid", "gameid"]]
 
     # Also include games with absolute rating >= min_absolute_rating
     if reviews is not None and not reviews.empty:
@@ -769,6 +908,10 @@ def build_user_profiles(
         combined = pd.concat([pos, high_rated], ignore_index=True).drop_duplicates()
     else:
         combined = pos.copy()
+    # A game cannot be both: a 4-star rating on a 4.5-star game is a negative.
+    disliked_pairs = set(zip(neg["userid"], neg["gameid"]))
+    combined = combined[[(u, g) not in disliked_pairs
+                         for u, g in zip(combined["userid"], combined["gameid"])]]
 
     # Pre-build lookup maps from game_docs. Profile text is encoder input, so it
     # is built from the normalised columns (falling back to the originals for
@@ -776,6 +919,9 @@ def build_user_profiles(
     game_docs_idx = game_docs.set_index("gameid")
     system_map = game_docs_idx[clean_col_in(game_docs.columns, "system")].to_dict()
     tags_map   = game_docs_idx[clean_col_in(game_docs.columns, "tags")].to_dict()
+    author_map = game_docs_idx[clean_col_in(game_docs.columns, "author")].to_dict()
+    lang_col   = clean_col("language")
+    lang_map   = game_docs_idx[lang_col].to_dict() if lang_col in game_docs.columns else {}
 
     # Name lookup from users table
     name_lookup: Dict[str, str] = {}
@@ -785,24 +931,45 @@ def build_user_profiles(
             users["name"].fillna("").astype(str),
         ))
 
+    neg_by_user = neg.groupby("userid")["gameid"].apply(list).to_dict()
+
     profiles = []
     for uid, grp in combined.groupby("userid"):
-        systems: List[str] = []
-        tags: List[str] = []
+        gids = [g for g in grp["gameid"] if g in game_docs_idx.index]
+        if not gids:
+            continue
+        liked_systems = [_split_values(system_map.get(g, "")) for g in gids]
+        liked_tags    = [_split_values(tags_map.get(g, "")) for g in gids]
 
-        for gid in grp["gameid"]:
-            # system column is comma-separated; split into individual values
-            systems.extend(
-                sv.strip() for sv in system_map.get(gid, "").split(",") if sv.strip()
+        systems: Counter = Counter(v for vals in liked_systems for v in vals)
+        tags: Counter    = Counter(v for vals in liked_tags for v in vals)
+        authors: Counter = Counter(v for g in gids for v in _split_values(author_map.get(g, ""))
+                                   if v.lower() not in _NON_AUTHORS)
+        langs: Counter   = Counter(v for g in gids for v in _split_values(lang_map.get(g, "")))
+
+        top_systems = [s for s, _ in systems.most_common(3)]
+        top_tags    = [t for t, _ in tags.most_common(_MAX_TAGS)]
+        top_authors = [a for a, _ in authors.most_common(_MAX_AUTHORS)]
+        n = len(gids)
+        qualifies = lambda c: c >= _PROFILE_MIN_GAMES and c / n >= _PROFILE_SHARE
+        languages = [l for l, c in langs.most_common() if qualifies(c)]
+        if languages == ["english"]:
+            languages = []
+
+        dislikes: List[str] = []
+        dis_gids = [g for g in neg_by_user.get(uid, []) if g in game_docs_idx.index]
+        if dis_gids:
+            dis_systems = [_split_values(system_map.get(g, "")) for g in dis_gids]
+            dis_tags    = [_split_values(tags_map.get(g, "")) for g in dis_gids]
+            dislikes = disliked_values(
+                [s + t for s, t in zip(liked_systems, liked_tags)],
+                [s + t for s, t in zip(dis_systems, dis_tags)],
+                exclude=set(top_systems) | set(top_tags),
             )
-            tags.extend(
-                t.strip() for t in str(tags_map.get(gid, "")).split(",") if t.strip()
-            )
 
-        top_systems = [s for s, _ in Counter(systems).most_common(3)]
-        top_tags    = [t for t, _ in Counter(tags).most_common(_MAX_TAGS)]
-
-        profile_text = format_profile_text(top_systems, top_tags)
+        profile_text = format_profile_text(
+            top_systems, top_tags, top_authors, languages=languages, dislikes=dislikes,
+        )
         if not profile_text:
             continue
 
@@ -813,3 +980,81 @@ def build_user_profiles(
         })
 
     return pd.DataFrame(profiles)
+
+
+# ---------------------------------------------------------------------------
+# Item co-occurrence sets (item-to-item encoder)
+# ---------------------------------------------------------------------------
+
+ITEM_SOURCES = ("liked", "wishlist", "poll", "reclist")
+
+
+def build_item_sets(
+    interactions: pd.DataFrame,
+    reviews: pd.DataFrame,
+    game_docs: pd.DataFrame,
+    wishlists: Optional[pd.DataFrame] = None,
+    pollvotes: Optional[pd.DataFrame] = None,
+    reclists: Optional[pd.DataFrame] = None,
+    reclistitems: Optional[pd.DataFrame] = None,
+    min_absolute_rating: float = 4.0,
+    min_set_size: int = 2,
+) -> pd.DataFrame:
+    """
+    Groups of games that belong together in someone's mind, for training the
+    item-to-item encoder. One row per (source, setid, gameid):
+
+      liked     a user's liked games — training positives plus anything they
+                rated >= min_absolute_rating, minus their training negatives
+      wishlist  a user's wishlist
+      poll      the games voted into one poll ("Best short games")
+      reclist   the games on one member's recommended list
+
+    Every source is keyed by a user (a poll vote and a list have an owner), so
+    a (user, game) pair held out for validation or testing is dropped from all
+    of them: otherwise a user's wishlist could hand the encoder the very pair
+    the evaluation asks it to find. Games outside `game_docs` are dropped, since
+    the encoder reads their documents. Sets smaller than `min_set_size` carry no
+    pairs and are dropped too.
+    """
+    known = set(game_docs["gameid"])
+    held_out = set(zip(
+        interactions.loc[interactions["split"] != "train", "userid"],
+        interactions.loc[interactions["split"] != "train", "gameid"],
+    ))
+
+    def _keep(df: pd.DataFrame) -> pd.DataFrame:
+        df = df[df["gameid"].isin(known)]
+        mask = [(u, g) not in held_out for u, g in zip(df["userid"], df["gameid"])]
+        return df[mask]
+
+    train = interactions[interactions["split"] == "train"]
+    pos = train[train["label"] == 1][["userid", "gameid"]]
+    disliked = set(zip(train.loc[train["label"] == 0, "userid"],
+                       train.loc[train["label"] == 0, "gameid"]))
+    high = reviews[reviews["rating"] >= min_absolute_rating][["userid", "gameid"]]
+    high = high[high["userid"].isin(set(pos["userid"]))]
+    liked = pd.concat([pos, high], ignore_index=True).drop_duplicates()
+    liked = liked[[(u, g) not in disliked for u, g in zip(liked["userid"], liked["gameid"])]]
+    frames = [_keep(liked).assign(source="liked", setid=lambda d: d["userid"])]
+
+    if wishlists is not None and len(wishlists):
+        frames.append(_keep(wishlists[["userid", "gameid"]])
+                      .assign(source="wishlist", setid=lambda d: d["userid"]))
+    if pollvotes is not None and len(pollvotes):
+        frames.append(_keep(pollvotes[["userid", "gameid", "pollid"]])
+                      .assign(source="poll", setid=lambda d: d["pollid"]))
+    if reclists is not None and reclistitems is not None and len(reclistitems):
+        items = reclistitems.merge(reclists[["listid", "userid"]], on="listid", how="inner")
+        frames.append(_keep(items[["userid", "gameid", "listid"]])
+                      .assign(source="reclist", setid=lambda d: d["listid"]))
+
+    sets = pd.concat([f[["source", "setid", "gameid"]] for f in frames], ignore_index=True)
+    sets = sets.drop_duplicates()
+    size = sets.groupby(["source", "setid"])["gameid"].transform("size")
+    sets = sets[size >= min_set_size].reset_index(drop=True)
+    for source in ITEM_SOURCES:
+        part = sets[sets["source"] == source]
+        logger.info("  item sets: %-8s %5d sets  %6d rows  %5d games",
+                    source, part["setid"].nunique(), len(part), part["gameid"].nunique())
+    return sets

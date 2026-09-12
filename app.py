@@ -114,7 +114,7 @@ MISSING = "—"
 MODE_PROMPTS = {"game": "Pick a game to get recommendations like it.",
                 "author": "Pick an author.",
                 "reviewer": "Pick a reviewer.",
-                "vibe": "Pick at least one system or tag."}
+                "vibe": "Pick at least one system, tag or author."}
 RATING_CHOICES = [round(0.5 * i, 1) for i in range(10)]      # 0.0 … 4.5
 RATING_COUNT_CHOICES = [0, 1, 2, 5, 10, 25, 50]
 
@@ -473,6 +473,27 @@ SYSTEM_CHOICES, TAG_CHOICES = vocab_choices(GAME_DOCS)
 # index — no second definition of "commonest" to drift from the first.
 SYSTEM_RANK = {value: i for i, (_label, value) in enumerate(SYSTEM_CHOICES)}
 TAG_RANK = {value: i for i, (_label, value) in enumerate(TAG_CHOICES)}
+
+
+def _vibe_author_choices():
+    """
+    Authors for the vibe picker, most prolific first, valued as the encoders
+    saw them. Profiles carry `author_clean` values — cased, "Emily Short" —
+    while `AUTHOR_CHOICES` is keyed by the lowercased author id, so the value
+    here is the display casing the same map gives the author-mode picker.
+    """
+    return [(label, AUTHOR_NAME_MAP.get(value, label)) for label, value in AUTHOR_CHOICES
+            if value not in EXCLUDED_AUTHORS]
+
+
+VIBE_AUTHOR_CHOICES = _vibe_author_choices()
+AUTHOR_RANK = {value: i for i, (_label, value) in enumerate(VIBE_AUTHOR_CHOICES)}
+
+
+def _canonical(values, rank):
+    """Fixed order for a pick list, as `canonical_vibe` does for systems and tags."""
+    far = float("inf")
+    return sorted(dict.fromkeys(values or []), key=lambda v: (rank.get(v, far), v))
 (GENRE_FILTER_CHOICES, SYSTEM_FILTER_CHOICES, AUTHOR_FILTER_CHOICES,
  TAG_FILTER_CHOICES, YEAR_CHOICES) = _filter_choices()
 YEAR_MAX, YEAR_MIN = YEAR_CHOICES[0], YEAR_CHOICES[-1]
@@ -563,7 +584,7 @@ def _rank(query_text, emb, exclude, cached):
 
 
 @lru_cache(maxsize=BROWSE_CACHE_SIZE)
-def _score_browse(systems, tags):
+def _score_browse(systems, tags, authors=()):
     """
     Score a browse query, shared across every visitor.
 
@@ -582,7 +603,7 @@ def _score_browse(systems, tags):
     downstream (`select_results` builds new ones), so sharing them is safe.
     """
     systems, tags = canonical_vibe(systems, tags, SYSTEM_RANK, TAG_RANK)
-    query_text = format_profile_text(systems, tags)
+    query_text = format_profile_text(systems, tags, _canonical(authors, AUTHOR_RANK))
 
     # A precomputed page, if this pick is one of the common ones. Same deal as
     # the other three modes: an offline job has no latency budget, so these were
@@ -959,7 +980,7 @@ def _build_filters(author, system, language, genre_tags, year_from, year_to,
     return filters
 
 
-def recommend(state, mode, game, author, user, systems, tags,
+def recommend(state, mode, game, author, user, systems, tags, v_authors,
               f_author, f_system, f_language, f_topics,
               f_year_from, f_year_to, f_rating, f_count, per_page, announce=False):
     """
@@ -993,7 +1014,8 @@ def recommend(state, mode, game, author, user, systems, tags,
     # Decided before filtering, because it governs whether the categorical
     # filters apply at all.
     systems, tags = _picked(systems), _picked(tags)
-    query_key = (mode, game, author, user, tuple(systems), tuple(tags))
+    v_authors = _picked(v_authors)
+    query_key = (mode, game, author, user, tuple(systems), tuple(tags), tuple(v_authors))
     reused = bool(state) and state.get("query_key") == query_key and state.get("scored")
     # Setting nine controls at the end of a run makes nine change events, each
     # re-entering here with the values just written. They cannot alter anything,
@@ -1019,13 +1041,19 @@ def recommend(state, mode, game, author, user, systems, tags,
                                   f_year_from, f_year_to, f_rating, f_count,
                                   year_bounds)
     exclude, cached, emb, query_text = set(), None, None, ""
+    # game and author are item-space modes: their live fallback is a nearest-
+    # neighbour lookup from these seeds (src/pipeline/items.py), never the
+    # reranker. The profile text is still built, for the query panel and the
+    # diversity targets.
+    item_seeds = None
 
     if mode == "game":
         if not game:
             return nothing(MODE_PROMPTS["game"])
         query_text = GAME_QUERY_TEXT_MAP.get(game, DOC_MAP.get(game, ""))
-        cached, exclude = PRE_GAME.get(game), {game}
-        emb = None if cached is not None else RETRIEVER._encode_game_ids([game])
+        cached, exclude, item_seeds = PRE_GAME.get(game), {game}, [game]
+        if cached is None and RETRIEVER.items is None:
+            emb = RETRIEVER._encode_game_ids([game])
         note = f"games like **{META.loc[game, 'title']}**"
 
     elif mode == "author":
@@ -1034,7 +1062,9 @@ def recommend(state, mode, game, author, user, systems, tags,
         query_text = AUTHOR_PROFILE_MAP.get(author, "")
         cached = PRE_AUTHOR.get(author)
         exclude = set(AUTHOR_GAMES.get(author, []))
-        emb = None if cached is not None else QUERY_ENCODER.encode([query_text], normalize_embeddings=True)[0]
+        item_seeds = list(exclude)
+        if cached is None and RETRIEVER.items is None:
+            emb = QUERY_ENCODER.encode([query_text], normalize_embeddings=True)[0]
         note = f"in the spirit of **{AUTHOR_NAME_MAP.get(author, author)}** (excluding their own games)"
 
     elif mode == "reviewer":
@@ -1050,10 +1080,11 @@ def recommend(state, mode, game, author, user, systems, tags,
         note = f"for **{USER_NAME_MAP.get(user, user)}** (excluding games they've rated or played)"
 
     else:  # vibe
-        if not systems and not tags:
+        if not (systems or tags or v_authors):
             return nothing(MODE_PROMPTS["vibe"])
         query_text = format_profile_text(
-            *canonical_vibe(systems or [], tags or [], SYSTEM_RANK, TAG_RANK))
+            *canonical_vibe(systems or [], tags or [], SYSTEM_RANK, TAG_RANK),
+            _canonical(v_authors, AUTHOR_RANK))
         emb = QUERY_ENCODER.encode([query_text], normalize_embeddings=True)[0]
         note = "games matching this vibe"
 
@@ -1063,13 +1094,22 @@ def recommend(state, mode, game, author, user, systems, tags,
     # Scoring is the expensive half and depends only on the query, never on the
     # filters. Reuse it while the user narrows results, and drop it as soon as
     # they change what they are searching for.
-    logger.info("query mode=%s systems=%s tags=%s | previous_key=%s | reused=%s",
-                mode, systems, tags, (state or {}).get("query_key"), bool(reused))
+    logger.info("query mode=%s systems=%s tags=%s authors=%s | previous_key=%s | reused=%s",
+                mode, systems, tags, v_authors, (state or {}).get("query_key"), bool(reused))
     if reused:
         scored, relevance = state["scored"], state["relevance"]
 
     elif mode == "vibe":
-        scored, relevance = _score_browse(tuple(systems or []), tuple(tags or []))
+        scored, relevance = _score_browse(tuple(systems or []), tuple(tags or []),
+                                          tuple(v_authors or []))
+    elif cached is None and item_seeds and RETRIEVER.items is not None:
+        logger.info("Item-space ranking: %d seed(s)", len(item_seeds))
+        scored, relevance = RETRIEVER.rank_items(
+            item_seeds, exclude=exclude, merge=RETR.get("author_merge", "centroid"),
+            min_score=RETR.get("min_item_score", 0.0),
+            bayesian_avg_map=BAYESIAN_AVG_MAP, rating_weight=RETR.get("rating_weight", 0.5),
+            allowed=set(GAME_INFO_MAP),
+        )
     else:
         scored, relevance = _rank(query_text, emb, exclude, cached)
     if not scored:
@@ -1210,6 +1250,7 @@ def _reset():
         gr.update(value=None, visible=False),            # user
         gr.update(value=[], visible=False),              # systems
         gr.update(value=[], visible=False),              # tags
+        gr.update(value=[], visible=False),              # vibe authors
         *FILTER_DEFAULTS[:4],                            # author, system, language, genres/tags
         gr.update(choices=YEAR_CHOICES, value=YEAR_MIN),  # year ≥, back to the
         gr.update(choices=YEAR_CHOICES, value=YEAR_MAX),  # corpus span it loads with
@@ -1223,7 +1264,8 @@ def _reset():
 
 
 def _visibility(mode):
-    return [gr.update(visible=(mode == m)) for m in ("game", "author", "reviewer", "vibe", "vibe")]
+    return [gr.update(visible=(mode == m))
+            for m in ("game", "author", "reviewer", "vibe", "vibe", "vibe")]
 
 
 def _mode_changed(mode, per_page):
@@ -1284,6 +1326,15 @@ def build_ui():
             # idea, and calling one "tags" made them look unrelated.
             tags = gr.Dropdown(TAG_CHOICES, value=[], label="genres/tags", info=PICK_HINT,
                                multiselect=True, visible=False)
+            # The one profile section a reviewer's history supplies that a vibe
+            # can supply too and that earns a picker: authors is the strongest
+            # taste signal the data has (see NOTES, "Which profile sections
+            # matter"). Dislikes measured as doing nothing to the ranking, and
+            # language is a constraint rather than a taste — for most readers
+            # the hardest filter there is — so it lives with the filters.
+            v_authors = gr.Dropdown(VIBE_AUTHOR_CHOICES, value=[], label="authors you like",
+                                    info=BIG_HINT.format(n=round(len(VIBE_AUTHOR_CHOICES) / 1000)),
+                                    multiselect=True, filterable=True, visible=False)
 
         with gr.Row(elem_id="action-row"):
             per_page = gr.Dropdown(PAGE_SIZES, value=DEFAULT_PAGE_SIZE, label="results per page", scale=1)
@@ -1378,17 +1429,19 @@ def build_ui():
         filter_controls = [f_author, f_system, f_language, f_topics,
                            f_year_from, f_year_to, f_rating, f_count]
         home.click(_reset, None,
-                   [mode, game, author, user, systems, tags, *filter_controls,
+                   [mode, game, author, user, systems, tags, v_authors,
+                    *filter_controls,
                     per_page, table, note, count, state, notice, pager, prev, nxt,
                     filters_block]).then(
             None, None, None, js=SCROLL_TO_TOP).then(
             None, None, None, js=COLLAPSE_FILTERS)
 
         mode.change(_mode_changed, [mode, per_page],
-                    [game, author, user, systems, tags, *filter_controls,
+                    [game, author, user, systems, tags, v_authors,
+                     *filter_controls,
                      filters_block, table, note, count, state, notice, pager,
                      prev, nxt]).then(None, None, None, js=COLLAPSE_FILTERS)
-        inputs = [state, mode, game, author, user, systems, tags,
+        inputs = [state, mode, game, author, user, systems, tags, v_authors,
                   *filter_controls, per_page]
         # The dynamic filters ride along on every run so their choices can be
         # rebuilt when the query changes and left alone when it does not.

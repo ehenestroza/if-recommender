@@ -13,7 +13,7 @@ database:
 
   # Raw IFDB dump served from a disposable container, used by: 01_extract.py --source dump
   dump:
-    path: "dump/ifdb-archive.sql.gz"   # .sql or .sql.gz; not version controlled
+    path: "dump/ifdb-archive-20260901.sql.gz"   # .sql or .sql.gz; not version controlled
     image: "mariadb:10.5.26"           # pinned to the server version in the dump header
     container_name: "ifdb-extract"
     tmpfs_size: "3g"                   # datadir in RAM; set to "" to use container storage
@@ -51,8 +51,31 @@ reranker_training:
   batch_size: 16
   learning_rate: 2.0e-5
 
+# Item-to-item encoder (03b_train_item_encoder.py): one tower over game
+# documents, trained so games that belong together in someone's mind embed
+# close. Serves `game` and `author` searches with no reranker.
+item_training:
+  epochs: 3
+  batch_size: 64
+  temperature: 0.05
+  learning_rate: 2.0e-5
+  warmup_ratio: 0.1
+  init_from: "doc_encoder"    # or "base": start from model.base_model instead
+  pairs_per_set_cap: 20       # pairs one set may contribute per epoch
+  source_weights:             # scale that cap per source
+    liked: 1.0                # a user's liked games — the strongest signal
+    poll: 1.0                 # games voted into one poll, thematic and curated
+    reclist: 0.7              # one member's recommended list
+    wishlist: 0.5             # interest, not yet a verdict
+  seed: 42
+
 retrieval:
-  min_retrieval_score: 0.25   # drop candidates with cosine similarity below this
+  # Drop candidates with cosine similarity below this. 0.15 since the 2026-09
+  # profiles: the query tower now embeds more specifically and the whole cosine
+  # distribution sits ~0.1 lower, so 0.25 left a median pool of 136 where the
+  # cap, tag policy and headroom were all measured against ~1,000. 0.15 restores
+  # that (median 1,010).
+  min_retrieval_score: 0.15
   min_rerank_score: 0.10      # relevance floor; low enough to leave filter headroom, high enough to display
   top_k_retrieve: 50          # raw-retrieval evaluation only; the pipeline reranks the whole pool
   top_k_rerank: 25
@@ -80,3 +103,8 @@ retrieval:
   use_rating_reranking: true  # blend normalised bayesian_avg into rerank score
   rating_weight: 0.5          # weight on bayesian_avg/5; 0.3-0.5 measure the same, above 0.5 hurts
   use_diversity: true         # post-rerank step to cover all target genres/systems
+  # Item modes (game, author): nearest neighbours in the item encoder's space.
+  # Floor on rescaled relevance (cosine above the random-pair baseline, see
+  # items.py). 0.30 leaves a median of ~1,000 candidates, rarely fewer than 50.
+  min_item_score: 0.30
+  author_merge: "centroid"    # "centroid" of the author's games, or "max" over them
