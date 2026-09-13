@@ -411,12 +411,13 @@ def profile_display(
     tag_freq: Optional[Counter] = None,
 ) -> str:
     """
-    Compact rendering of a profile: "twine, ink // mystery, surreal".
+    Compact rendering of a profile, every section labelled:
+
+        "systems: twine, ink // authors: Pseudavid // tags: mystery, surreal // dislikes: ghost"
 
     The stored form ("Systems: … Tags: …") is what the encoders were trained on
-    and must not change; this is presentation only. Dropping the labels keeps it
-    lowercase and avoids implying the second list is only tags — genre values are
-    folded into it during preprocessing.
+    and must not change; this is presentation only. Authors come before tags
+    because there are fewer of them, and dislikes last.
 
     Pass the frequency maps to order by how common each value is across the
     corpus, or omit them to keep the stored order. Which is right depends on
@@ -434,13 +435,11 @@ def profile_display(
         systems = sorted(systems, key=lambda v: (-system_freq.get(v, 0), v))
     if tag_freq is not None:
         tags = sorted(tags, key=lambda v: (-tag_freq.get(v, 0), v))
-    parts = [", ".join(systems), ", ".join(tags)]
-    # The later sections are short and already lowercase; they read fine as
-    # labelled tails, and the dislikes need the label to make sense at all.
-    for label in ("Authors", "Era", "Language", "Dislikes"):
-        if sections.get(label):
-            parts.append(f"{label.lower()}: {', '.join(sections[label])}")
-    return " // ".join(part for part in parts if part)
+    ordered = [("systems", systems), ("authors", sections.get("Authors", [])),
+               ("tags", tags), ("era", sections.get("Era", [])),
+               ("language", sections.get("Language", [])),
+               ("dislikes", sections.get("Dislikes", []))]
+    return " // ".join(f"{label}: {', '.join(values)}" for label, values in ordered if values)
 
 
 def profile_vocabulary(

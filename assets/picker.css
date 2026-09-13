@@ -1,0 +1,57 @@
+/* Client-side pickers (assets/picker.js). Styled from the theme's variables so
+   they match the Gradio fields beside them in both colour schemes. */
+.if-hidden { display: none !important; }
+/* The HTML block itself: the same fill as the dropdown blocks it sits among,
+   and none of the chrome — the widget draws its own. */
+.if-ac-wrap { background: var(--block-background-fill) !important; border: none !important;
+  box-shadow: none !important; padding: 0 !important; }
+.if-ac-wrap .html-container { padding: 0 !important; }
+.if-ac { position: relative; padding: var(--block-padding, 12px); }
+.if-ac__label { display: block; font-weight: 500; color: var(--block-title-text-color);
+  font-size: var(--block-title-text-size); margin-bottom: 2px; }
+.if-ac__info { font-size: var(--block-info-text-size); color: var(--block-info-text-color);
+  font-weight: 300; margin-bottom: 8px; }
+.if-ac__field { position: relative; display: flex; flex-wrap: wrap; align-items: center; gap: 4px 6px;
+  background: var(--input-background-fill); border-radius: var(--input-radius);
+  border: 1px solid transparent; padding: 4px 8px; min-height: 44px; cursor: text; }
+.if-ac__field:hover { background: var(--input-background-fill-hover); }
+.if-ac__field:focus-within { border-color: var(--input-border-color-focus);
+  background: var(--input-background-fill-focus); }
+.if-ac input { flex: 1 1 8em; min-width: 6em; border: none; outline: none; background: none;
+  font: inherit; font-size: var(--input-text-size); font-weight: 300;
+  color: var(--body-text-color); padding: 5px 2px; }
+.if-ac input::placeholder { color: var(--input-placeholder-color); }
+.if-ac input:disabled { color: var(--body-text-color-subdued); }
+.if-ac__chips { display: contents; }
+.if-ac__chip { display: inline-flex; align-items: center; gap: 4px; padding: 2px 6px 2px 9px;
+  border-radius: 999px; font-size: 12.5px; background: var(--background-fill-primary);
+  border: 1px solid var(--border-color-primary); color: var(--body-text-color);
+  max-width: 100%; }
+.if-ac__chip-x { border: none; background: none; cursor: pointer; font: inherit;
+  font-size: 15px; line-height: 1; padding: 0 2px; color: var(--body-text-color-subdued); }
+.if-ac__chip-x:hover { color: var(--body-text-color); }
+.if-ac__menu { position: absolute; top: calc(100% + 4px); left: 0; right: 0;
+  z-index: 50; padding: 4px 0;
+  background: var(--background-fill-primary); border: 1px solid var(--border-color-primary);
+  border-radius: var(--input-radius); box-shadow: 0 6px 20px rgba(0,0,0,0.12); }
+.if-ac__opt { display: flex; align-items: baseline; gap: 12px; padding: 7px 12px;
+  cursor: pointer; font-size: var(--input-text-size); font-weight: 300;
+  color: var(--body-text-color); }
+.if-ac__opt-name { flex: 1 1 auto; min-width: 0; white-space: nowrap; overflow: hidden;
+  text-overflow: ellipsis; }
+.if-ac__opt-note { flex: 0 0 auto; font-size: 12px; color: var(--body-text-color-subdued);
+  white-space: nowrap; }
+.if-ac__opt b { font-weight: 500; }
+.if-ac__opt:hover, .if-ac__opt.is-picked { background: var(--background-fill-secondary); }
+/* Groups, rows and the filters accordion clip overflow; the menu must escape
+   every one of them, so every ancestor of a picker lets it. */
+.gradio-container :has(.if-ac) { overflow: visible !important; }
+/* The four filter pickers share their row with nothing but each other; size
+   them as the dropdown row's blocks are sized, and let the hidden textboxes
+   take no room. */
+.picker-row { gap: 0 !important; }
+.picker-row > .if-ac-wrap { min-width: 0 !important; margin: 0 !important; }
+/* Two across, always: the app's control-row rules size these as they size the
+   dropdown row below. */
+/* A single picker (game, author, reviewer) is capped at the width of one of
+   the three vibe pickers; a search box the width of the page looks wrong. */

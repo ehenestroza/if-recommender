@@ -12,7 +12,10 @@ trained on:
 Run locally with `python app.py`; Hugging Face Spaces picks this file up by name.
 """
 
+import gzip
+import hashlib
 import importlib.util
+import json
 import logging
 from datetime import date
 from functools import lru_cache
@@ -20,6 +23,7 @@ from pathlib import Path
 
 import gradio as gr
 import pandas as pd
+from fastapi import Request, Response
 from collections import Counter
 from html import escape
 import yaml
@@ -71,8 +75,7 @@ RESULT_COLUMNS = ["#", "title", "author", "year", "relevance", "rating",
 # Even sizes only, and no 25. Results are two-up above 1024px, so an odd page
 # size leaves a lone card in the last row with an empty slot beside it — which
 # reads as "that is all there is" even when more pages follow.
-PAGE_SIZES = [10, 20, 50]
-DEFAULT_PAGE_SIZE = 20
+DEFAULT_PAGE_SIZE = 20   # the page size; the "results per page" control was not worth its space
 SCROLL_TO_TOP = "() => window.scrollTo({top: 0, behavior: 'smooth'})"
 # Collapsing the filter block has to happen in the browser. An Accordion opened
 # by the reader is opened client-side only — the server still holds `open=False`
@@ -98,12 +101,10 @@ BROWSE_CACHE_SIZE = 2_048
 # "type to search" rather than "start typing to search": the hint sits under a
 # label on a phone, where the saved characters are the difference between one
 # line and two.
-BIG_HINT = "type to search · {n}K options, first open takes a second"
-PICK_HINT = "choose one or more"
-# The four text-valued filters all accept a typed fragment and match by
-# substring, so they carry the same hint — documenting it on only one would
-# imply the others behave differently.
-FREE_TEXT_HINT = "type text fragments and press return · case insensitive"
+# The hint under each picker's label: what the numbers beside the entries
+# count, and for the vibe pickers that more than one may be picked.
+HINT = "type to search · most {what} first"
+MULTI_HINT = HINT + " · choose one or more"
 # Shown when IFDB simply has no value for a field — 27% of games have no genre,
 # and a couple of hundred lack a system or year. Every field reserves its line
 # on a card, so a blank value reads as a rendering fault; an em dash reads as
@@ -130,7 +131,7 @@ DATA_LICENSE_URL = "https://creativecommons.org/licenses/by/3.0/us/"
 # one unambiguous edit and no reader has to guess whether 6/1 is June or
 # January. `data/manifest.json` deliberately carries no timestamp — it records
 # what the data *is*, not when it was taken — so this cannot be derived.
-DATA_THROUGH = "2026-06-01"
+DATA_THROUGH = "2026-09-01"
 
 
 def _link(href: str, text: str) -> str:
@@ -232,70 +233,101 @@ FOOTER_HTML = (
 # bands between the filter cells at 560px, which read as a rendering fault.
 # Gradio's own 1px gap is the hairline — leave it alone and size the children
 # to `calc(50% - 0.5px)` so two of them plus the gap come to exactly 100%.
+# Type and surfaces follow spreadthewordlist.pages.dev, minus its lavender:
+# Poppins at 14px/300 with 500 for anything that needs weight, 13px in fields
+# and buttons, flat fields with no border, 8px blocks and 6px controls. Set on
+# the theme rather than in CSS wherever a variable exists, so dark mode keeps
+# its own values instead of inheriting a light-mode hex.
+THEME = gr.themes.Monochrome(
+    font=[gr.themes.GoogleFont("Poppins", weights=(300, 400, 500)), "Century Gothic", "Avenir Next",
+          "ui-sans-serif", "system-ui", "sans-serif"],
+).set(
+    body_text_size="14px", body_text_weight="300",
+    prose_text_size="14px", prose_text_weight="300", prose_header_text_weight="500",
+    block_title_text_size="14px", block_title_text_weight="500",
+    block_label_text_weight="500", block_info_text_size="12.5px", block_info_text_weight="300",
+    input_text_size="13px", input_text_weight="300",
+    button_large_text_size="13px", button_large_text_weight="500",
+    button_small_text_size="12.5px", button_small_text_weight="400",
+    block_radius="8px", input_radius="6px",
+    button_large_radius="6px", button_small_radius="6px",
+    input_background_fill="#f1f1f1", input_background_fill_hover="#e9e9e9",
+    input_background_fill_focus="#e9e9e9",
+    input_background_fill_hover_dark="*neutral_700", input_background_fill_focus_dark="*neutral_700",
+    input_border_color="transparent", input_border_color_hover="transparent",
+    input_border_color_dark="transparent", input_border_color_hover_dark="transparent",
+    input_border_color_focus="*neutral_400", input_border_color_focus_dark="*neutral_500",
+    button_primary_shadow="none", button_secondary_shadow="none",
+    block_shadow="none", block_label_shadow="none",
+)
+
 CSS = """
-:root, .gradio-container { font-family: "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace !important; }
-.gradio-container { max-width: 1280px !important; width: 100% !important;
+.gradio-container { line-height: 1.75; }
+b, strong { font-weight: 500; }
+.gradio-container { max-width: 768px !important; width: 100% !important;
   margin: 0 auto !important;
-  padding: 1.2em clamp(0.25rem, 1.5vw, 1.6em) !important; box-sizing: border-box !important;
-  --block-radius: 10px; --block-border-width: 1px;
+  padding: 1.2em 0.75rem !important; box-sizing: border-box !important;
+  --block-border-width: 1px;
   --block-border-color: rgba(128,128,128,0.16);
-  --block-shadow: none; --block-label-shadow: none;
   --border-color-primary: rgba(128,128,128,0.07);
   --border-color-secondary: rgba(128,128,128,0.07);
-  --input-radius: 8px; --input-border-color: rgba(128,128,128,0.22);
-  --button-large-radius: 8px; --button-small-radius: 6px;
-  --button-primary-shadow: none; --button-secondary-shadow: none;
   --app-link: #2563eb; --app-link-visited: #7c3aed; }
 .dark .gradio-container { --app-link: #7aa7ff; --app-link-visited: #cba6ff; }
-.gradio-container .app { padding-left: clamp(0.25rem, 1.5vw, var(--size-8)) !important;
-  padding-right: clamp(0.25rem, 1.5vw, var(--size-8)) !important;
+/* Vertical rhythm. Gradio spaces the top-level blocks 28px apart and an empty
+   message block still takes a gap at zero height, so the page arrived with
+   two or three of them between things. One gap, and nothing empty holds a
+   slot. */
+.gradio-container .column:has(> #home-title) { gap: 12px !important; }
+#summary:not(:has(p)), #notice:not(:has(p)), #result-count:not(:has(p)) { display: none !important; }
+/* Fixed gutters: with the width capped, viewport-relative padding only made
+   the fields a different size on every screen. */
+.gradio-container .app { padding-left: 0.5rem !important; padding-right: 0.5rem !important;
   max-width: 100% !important; }
-h1 { font-weight: 600 !important; letter-spacing: -0.01em; margin-bottom: 0.6em !important; }
+h1 { font-weight: 500 !important; letter-spacing: -0.02em; margin-bottom: 0.6em !important; }
 #home-title { background: none !important; border: none !important; box-shadow: none !important;
-  padding: 0 !important; margin: 0 0 0.6em !important; width: auto !important;
+  padding: 0 !important; margin: 0 0 0.2em !important; width: auto !important;
   min-width: 0 !important; min-height: 0 !important; text-align: left !important;
   justify-content: flex-start !important; align-self: flex-start !important;
-  font-size: 26px !important; font-weight: 600 !important; letter-spacing: -0.01em;
+  font-size: 24px !important; font-weight: 500 !important; letter-spacing: -0.02em;
   color: var(--body-text-color) !important; }
 #home-title:hover { opacity: 0.65; }
 #results { border: none !important; background: none !important; box-shadow: none !important;
   padding: 0 !important; }
 #results .html-container { padding: 0 !important; }
-#results .results-table { width: 100%; display: block; font-size: 1em; margin-top: 0.6em;
+#results .results-table { width: 100%; display: block; font-size: 1em; margin-top: 0;
   border: none !important; }
 #results .results-table td { text-indent: 0 !important; }
-#results .results-table tbody { display: grid; gap: 0.75em; align-items: stretch;
+#results .results-table tbody { display: grid; gap: 0.6em; align-items: start;
   grid-template-columns: minmax(0, 1fr); }
 #results .results-table tr { display: flex; flex-wrap: wrap; align-items: baseline;
-  border: 1px solid rgba(128,128,128,0.18); border-radius: 10px;
+  border: 1px solid rgba(128,128,128,0.18); border-radius: 8px;
   padding: 0.7em 0.85em; margin: 0; }
 #results .results-table tr:hover { border-color: rgba(128,128,128,0.34); }
 #results .results-table td { display: grid; grid-template-columns: 6rem minmax(0, 1fr);
   gap: 0.5em; flex: 1 1 100%; min-width: 0; border: none; padding: 0.18em 0;
   line-height: 1.5; overflow-wrap: break-word; }
-#results .results-table td::before { content: attr(data-label); opacity: 0.45;
-  font-size: 0.85em; letter-spacing: 0.04em; }
+#results .results-table td::before { content: attr(data-label); opacity: 0.5;
+  font-size: 0.9em; font-weight: 400; }
 #results .results-table td .v { display: block; min-width: 0; min-height: 1.5em;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* Clamped, not fixed: with one column there is nothing to keep cards level
+   with, so a short tag list or description ends where it ends. */
 #results .results-table td[data-label="tags"] .v { white-space: normal;
-  display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 5;
-  line-clamp: 5; height: 7.5em; }
+  display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 4;
+  line-clamp: 4; max-height: 6em; }
 #results .results-table td[data-label="description"] .v { white-space: normal;
-  display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2;
-  line-clamp: 2; height: 3em; }
+  display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3;
+  line-clamp: 3; max-height: 4.5em; }
 #results .results-table td[data-label="#"],
 #results .results-table td[data-label="title"] {
   display: block; flex: 0 1 auto; padding-bottom: 0.3em; }
 #results .results-table td[data-label="#"]::before,
 #results .results-table td[data-label="title"]::before { content: none; }
 #results .results-table td[data-label="#"] { order: -2; margin-right: 0.55em;
-  font-weight: 700 !important; color: var(--body-text-color) !important; }
+  font-weight: 500 !important; color: var(--body-text-color) !important; }
 #results .results-table td[data-label="title"] { order: -1; flex: 1 1 0%; font-size: 1.05em;
   min-width: 0; overflow: hidden; }
-@media (min-width: 1024px) {
-  #results .results-table tbody { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0.85em; }
-}
-#results .results-table a { text-decoration: none; font-weight: 600; display: inline !important;
+#results .results-table a { text-decoration: none; font-weight: 500; display: inline !important;
   text-indent: 0 !important; padding: 0 !important; margin: 0 !important; border: none !important;
   color: var(--app-link) !important; }
 #results .results-table a:visited { color: var(--app-link-visited) !important; }
@@ -313,64 +345,63 @@ h1 { font-weight: 600 !important; letter-spacing: -0.01em; margin-bottom: 0.6em 
 .block-header { padding: 0.65em 0 0.6em 0.85em !important; margin: 0 !important;
   background: var(--block-background-fill) !important; border: none !important;
   border-bottom: 1px solid rgba(128,128,128,0.16) !important;
-  border-radius: 10px 10px 0 0 !important; letter-spacing: 0.03em; }
-.block-header p, .block-header span { font-size: 1.05em !important;
+  border-radius: 8px 8px 0 0 !important; }
+.block-header p, .block-header span { font-size: 1em !important;
   color: var(--body-text-color) !important; font-weight: 500 !important; }
 .block-header .block-header { border-bottom: none !important; padding: 0 !important;
   background: none !important; }
 #filters-block { padding: 0 !important; }
 #filters-block .label-wrap { padding: 0.65em 0.85em 0.6em !important; margin: 0 !important; }
 #filters-block .label-wrap, #filters-block .label-wrap span {
-  font-size: 1.05em !important; font-weight: 500 !important; letter-spacing: 0.03em;
+  font-size: 1em !important; font-weight: 500 !important;
   color: var(--body-text-color) !important; }
 #filters-block .label-wrap:hover { background: rgba(128,128,128,0.05) !important; }
 #filters-block .label-wrap.open { border-bottom: 1px solid rgba(128,128,128,0.16) !important; }
 #filters-block .column { gap: 0 !important; }
 #filters-head { background: none !important; border: none !important;
-  padding: 0 0.5em 0 0 !important; }
-/* Padding in rem, not em: em would be relative to this element's own font
-   size, so changing the text size would silently shift the indent too. */
-/* Page background, not the group's fill, so the line does not read as an input.
-   Uses the theme variable so it stays correct in dark mode too. */
-.filter-hint { padding: var(--spacing-xl, 14px) 0 0.6em 1rem !important; margin: 0 !important;
-  background: var(--block-background-fill) !important; }
-.filter-hint .filter-hint { padding: 0 !important; background: none !important; }
-/* Size the text only, never the wrapper too — em on both compounds. */
-.filter-hint p, .filter-hint span { font-size: 0.92em !important; line-height: 1.3 !important;
-  color: var(--block-info-text-color) !important; }
-#summary:has(p) { position: relative; margin: 2.2em 0 0.2em !important;
-  padding: 0.9em 1.05em !important; border-radius: 10px !important;
+  padding: 0.7em 0 0 1rem !important; }
+#summary:has(p) { position: relative; margin: 0 !important;
+  padding: 0.9em 1.05em !important; border-radius: 8px !important;
   background: linear-gradient(rgba(128,128,128,0.10), rgba(128,128,128,0.10)),
     var(--block-background-fill) !important;
   border: 1px solid rgba(128,128,128,0.14) !important; }
-#summary:has(p)::before { content: ""; position: absolute; left: 0; right: 0; top: -1.15em;
-  border-top: 1px solid rgba(128,128,128,0.18); }
 #summary p { margin: 0.2em 0 !important; }
+/* The profile is data, but it is a sentence of words: the body face reads
+   better than monospace, and the box keeps it looking quoted. */
 #summary code { background: var(--block-background-fill) !important;
-  border: 1px solid rgba(128,128,128,0.18) !important; }
+  border: 1px solid rgba(128,128,128,0.18) !important;
+  font-family: inherit !important; font-size: 13px !important; font-weight: 300; }
 /* Same slab as the summary, minus the rule above it: this one sits under the
    filters, where a separator would read as a second section starting. */
-#notice:has(p) { margin: 1.6em 0 0.2em !important;
-  padding: 0.9em 1.05em !important; border-radius: 10px !important;
+#notice:has(p) { margin: 0.4em 0 0 !important;
+  padding: 0.9em 1.05em !important; border-radius: 8px !important;
   background: linear-gradient(rgba(128,128,128,0.10), rgba(128,128,128,0.10)),
     var(--block-background-fill) !important;
   border: 1px solid rgba(128,128,128,0.14) !important; }
 #notice p { margin: 0.2em 0 !important; }
-#result-count { margin: 1.4em 0 0 !important; }
+/* Indented to the labels inside the blocks above and below it. */
+#result-count { margin: 0.4em 0 0 !important; padding-left: calc(var(--spacing-xl, 12px) + 2px) !important; }
 #result-count p { margin: 0 !important; font-size: 0.92em !important; opacity: 0.6; }
 #pager:not(:has(.md p)) { display: none !important; }
 footer { display: none !important; }
-#page-footer { margin-top: 2.2em !important; padding: 1em 0 0.4em !important;
+#page-footer { margin-top: 1.4em !important; padding: 1em 0 0.4em !important;
   border-top: 1px solid rgba(128,128,128,0.14) !important; }
-#page-footer p { margin: 0 !important; font-size: 0.9em !important; line-height: 1.7 !important;
-  letter-spacing: 0.02em; color: var(--body-text-color-subdued) !important; }
+#page-footer p { margin: 0 !important; font-size: 12.5px !important; line-height: 1.7 !important;
+  color: var(--body-text-color-subdued) !important; }
 #page-footer a { color: var(--app-link) !important; text-decoration: underline;
   text-underline-offset: 3px; }
 #page-footer a:visited { color: var(--app-link-visited) !important; }
 #page-footer a:hover { text-decoration-thickness: 2px; }
 
+/* One layout at every width. The app is capped at 768px — one column of
+   results, two columns of filters, a full-width button — because wider
+   screens only ever stretched search boxes and cards into something
+   unwieldy, and two columns of cards read oddly. What used to be the phone
+   band is the only band; only the iOS zoom guard still keys on the device. */
 @media (max-width: 768px) {
   input, textarea, select { font-size: 16px !important; }
+}
+@media (min-width: 0) {
   .control-row *, #action-row * { min-width: 0 !important; }
   .control-row, .control-row > * { flex-wrap: wrap !important; }
   .control-row > * {
@@ -390,6 +421,7 @@ footer { display: none !important; }
   }
   #action-row { flex-wrap: wrap !important; }
   #action-row > * { flex: 1 1 100% !important; max-width: 100% !important; }
+  #filters-head { flex-wrap: wrap !important; }
   .gr-button { min-height: 44px !important; }
   #reset-filters { min-height: 0 !important; }
 }
@@ -511,7 +543,7 @@ YEAR_MAX, YEAR_MIN = YEAR_CHOICES[0], YEAR_CHOICES[-1]
 # single field they are presented as, then the numeric ones in card order too.
 # Index positions are load-bearing — the reset button and `_build_filters` both
 # unpack this positionally.
-FILTER_DEFAULTS = ([], [], [], [], YEAR_MIN, YEAR_MAX, 3.0, 1)
+FILTER_DEFAULTS = ("", "", "", "", YEAR_MIN, YEAR_MAX, 3.0, 1)
 
 
 # ---------------------------------------------------------------------------
@@ -761,7 +793,7 @@ NO_PAGES = (gr.update(interactive=False), gr.update(interactive=False))
 
 # Filters have nothing to narrow until a query returns something, so the block
 # stays hidden and its choices are left untouched.
-NO_FILTERS = (gr.update(visible=False), *(gr.update() for _ in range(8)))
+NO_FILTERS = (gr.update(visible=False), *(gr.update() for _ in range(9)))
 
 
 # gameid -> the display-cased values each dynamic filter can offer for it.
@@ -820,83 +852,6 @@ _FILTER_VALUES = {
 }
 
 
-def _year_span(results):
-    """
-    The year range a result set covers, as (low, high).
-
-    Continuous, gaps included: the corpus has no 1968 or 1971-1976, and a
-    dropdown that skips the years between its ends looks broken rather than
-    precise. Falls back to the corpus span when nothing is dated.
-    """
-    years = [int(y) for y in
-             (str(GAME_INFO_MAP.get(gid, {}).get("year", "")).strip() for gid, _ in results)
-             if y.isdigit()]
-    return (min(years), max(years)) if years else (YEAR_MIN, YEAR_MAX)
-
-
-def _ladder_window(ladder, observed):
-    """
-    Trim a fixed ladder of thresholds to the rungs that change anything.
-
-    A rung above everything observed returns nothing. A rung below the lowest
-    observed value returns exactly what the next rung up returns. Both are dead
-    clicks, so the window runs from the highest rung at or below the minimum to
-    the highest rung at or below the maximum: counts of 2, 3, 8, 10, 12 against
-    [0, 1, 2, 5, 10, 25, 50] leave [2, 5, 10].
-    """
-    if not observed:
-        return list(ladder)
-    lo, hi = min(observed), max(observed)
-    floor = max((v for v in ladder if v <= lo), default=ladder[0])
-    return [v for v in ladder if floor <= v <= hi] or [floor]
-
-
-def _clamp_to(window, value):
-    """The nearest offered rung to a value that may have fallen outside it."""
-    if value in window:
-        return value
-    number = _as_float(value, None)
-    if number is None:
-        return window[0]
-    return window[0] if number < float(window[0]) else window[-1]
-
-
-def _rating_ladders(pool):
-    """
-    The rating and rating-count rungs worth offering for a scored pool.
-
-    Derived from the pool rather than from the results on screen, because the
-    results on screen have always had the rating filter applied to them: rungs
-    read back off them would start at the 3.0 default, so the filter could only
-    ever be tightened and the tail below it would be unreachable. The pool is
-    the same set before these two thresholds touched it.
-    """
-    counts, ratings, unrated = [], [], False
-    for gid, _ in pool:
-        info = GAME_INFO_MAP.get(gid) or {}
-        try:
-            n = int(info.get("review_count") or 0)
-        except (TypeError, ValueError):
-            n = 0
-        counts.append(n)
-        if not n:
-            unrated = True
-            continue
-        try:
-            ratings.append(float(info.get("avg_rating")))
-        except (TypeError, ValueError):
-            pass
-    rating = _ladder_window(RATING_CHOICES, ratings)
-    # 0.0 is not a threshold like the others: it turns the filter off entirely,
-    # and that is the only setting under which unrated games appear at all. It
-    # earns its place whenever the pool holds one, however high the rated
-    # minimum sits. The count ladder needs no such rule — an unrated game counts
-    # zero, so the 0 rung falls out of the observed values on its own.
-    if unrated and RATING_CHOICES[0] not in rating:
-        rating = [RATING_CHOICES[0], *rating]
-    return rating, _ladder_window(RATING_COUNT_CHOICES, counts)
-
-
 def _choices_from_results(results):
     """
     The values each dynamic filter should offer, given a result set.
@@ -917,7 +872,7 @@ def _choices_from_results(results):
             continue
         for field, counter in counters.items():
             counter.update(values[field])
-    return {field: [v for v, _ in c.most_common()] for field, c in counters.items()}
+    return {field: c.most_common() for field, c in counters.items()}
 
 
 def _picked(value) -> list:
@@ -931,8 +886,99 @@ def _picked(value) -> list:
     """
     if value is None:
         return []
+    if isinstance(value, str):
+        # A picker's hidden textbox: a JSON array for multi-select, else one id.
+        text = value.strip()
+        if text.startswith("["):
+            try:
+                value = json.loads(text)
+            except ValueError:
+                value = [text]
+        else:
+            value = [text] if text else []
     items = value if isinstance(value, (list, tuple)) else [value]
     return [str(v).strip() for v in items if v is not None and str(v).strip()]
+
+
+# ---------------------------------------------------------------------------
+# The big pickers
+# ---------------------------------------------------------------------------
+#
+# A dropdown of ten thousand games ships every option to the browser, renders
+# them all on first open — a second-long stall — and then asks the reader to
+# scroll a list nobody can scroll; and its own filter is a substring match that
+# cannot be changed. These pickers are a widget of our own (assets/picker.js),
+# modelled on the answers search at spreadthewordlist.pages.dev: type, and the
+# ten commonest entries *starting* with what you typed appear, prefix in bold;
+# arrows and Enter choose; nothing leaves the browser until "recommend". The
+# lists come from one gzipped route on this app, fetched once per page load
+# and revalidated by ETag, so a data refresh reaches a returning visitor.
+#
+# Each widget mirrors its value into a hidden textbox — an id, or a JSON array
+# for multi-select — which is what `recommend` reads, and Python clears it the
+# same way (a client-side `change` handler on the textbox tells the widget).
+
+ASSETS_DIR = Path(__file__).resolve().parent / "assets"
+PICKER_JS = (ASSETS_DIR / "picker.js").read_text()
+PICKER_CSS = (ASSETS_DIR / "picker.css").read_text()
+LISTS_ROUTE = "/if/lists.json"
+
+
+
+def _choice_label(choice) -> str:
+    return choice[0] if isinstance(choice, (list, tuple)) else choice
+
+
+def _choice_value(choice):
+    return choice[1] if isinstance(choice, (list, tuple)) else choice
+
+
+PICKER_LISTS = {
+    "game": GAME_CHOICES, "author": AUTHOR_CHOICES, "reviewer": USER_CHOICES,
+    "systems": SYSTEM_CHOICES, "tags": TAG_CHOICES, "v_authors": VIBE_AUTHOR_CHOICES,
+}
+_lists_json = json.dumps(
+    {name: [[_choice_label(c), _choice_value(c)] for c in choices]
+     for name, choices in PICKER_LISTS.items()},
+    ensure_ascii=False, separators=(",", ":"),
+).encode()
+LISTS_GZ = gzip.compress(_lists_json, mtime=0)
+LISTS_ETAG = '"' + hashlib.sha1(_lists_json).hexdigest()[:16] + '"'
+HEAD = f"<script>{PICKER_JS}\nIF.load({LISTS_ROUTE!r});</script>"
+
+
+def picker(name, label, info="", multi=False, custom=False, visible=True, placeholder="",
+           classes=()):
+    """
+    One client-side picker: the widget markup, and the hidden textbox that
+    carries its value. `custom` lets Enter commit typed text that matches
+    nothing — the filters take fragments, the query pickers do not. `classes`
+    go on the block, for layout.
+    """
+    html = (
+        f'<div class="if-ac" data-name="{name}" data-multi="{int(multi)}" data-custom="{int(custom)}">'
+        f'<label class="if-ac__label" for="if-in-{name}">{escape(label)}</label>'
+        + (f'<div class="if-ac__info">{escape(info)}</div>' if info else "")
+        + '<div class="if-ac__field"><span class="if-ac__chips" hidden></span>'
+        f'<input id="if-in-{name}" type="text" role="combobox" autocomplete="off" spellcheck="false" '
+        f'aria-label="{escape(label)}" aria-autocomplete="list" aria-expanded="false" '
+        f'placeholder="{escape(placeholder)}">'
+        '<div class="if-ac__menu" role="listbox" hidden></div></div></div>'
+    )
+    widget = gr.HTML(html, visible=visible, elem_classes=["if-ac-wrap", *classes], padding=False)
+    box = gr.Textbox(value="", elem_id=f"if-box-{name}", elem_classes="if-hidden",
+                     container=False, show_label=False)
+    box.change(None, [box], None, js=f"(v) => {{ IF.sync({name!r}, v); }}")
+    return widget, box
+
+
+def lists_route(request: Request) -> Response:
+    """The picker lists, gzipped, revalidated by ETag so a data refresh shows."""
+    if request.headers.get("if-none-match") == LISTS_ETAG:
+        return Response(status_code=304, headers={"ETag": LISTS_ETAG})
+    return Response(LISTS_GZ, media_type="application/json",
+                    headers={"Content-Encoding": "gzip", "ETag": LISTS_ETAG,
+                             "Cache-Control": "no-cache"})
 
 
 def _as_float(value, default):
@@ -944,15 +990,15 @@ def _as_float(value, default):
 
 
 def _build_filters(author, system, language, genre_tags, year_from, year_to,
-                   rating, count, year_bounds=None):
+                   rating, count):
     """
     Turn the filter dropdowns into apply_hard_filters kwargs.
 
-    `year_bounds` is the span the year dropdowns are currently offering, which
-    is the result set's own range rather than the corpus's. It decides whether
-    the year filter counts as narrowed: selecting the full offered span must
-    mean "no constraint", because applying a range drops every game with no
-    recorded year — 184 of them — and the reader never asked for that.
+    The year dropdowns always offer the whole corpus span, and selecting all of
+    it must mean "no constraint": applying a range drops every game with no
+    recorded year — 184 of them — and the reader never asked for that. (They
+    used to be trimmed to the result set's own span, which read as the dataset
+    stopping at 2022 rather than the results.)
     """
     filters = {}
     author, system = _picked(author), _picked(system)
@@ -972,17 +1018,16 @@ def _build_filters(author, system, language, genre_tags, year_from, year_to,
         filters["min_rating"] = rating
     if count:
         filters["min_rating_count"] = count
-    lo_bound, hi_bound = year_bounds or (YEAR_MIN, YEAR_MAX)
-    low = _as_int(year_from, lo_bound) if year_from else lo_bound
-    high = _as_int(year_to, hi_bound) if year_to else hi_bound
-    if low > lo_bound or high < hi_bound:
+    low = _as_int(year_from, YEAR_MIN) if year_from else YEAR_MIN
+    high = _as_int(year_to, YEAR_MAX) if year_to else YEAR_MAX
+    if low > YEAR_MIN or high < YEAR_MAX:
         filters["year_range"] = f"{low}-{high}"
     return filters
 
 
 def recommend(state, mode, game, author, user, systems, tags, v_authors,
               f_author, f_system, f_language, f_topics,
-              f_year_from, f_year_to, f_rating, f_count, per_page, announce=False):
+              f_year_from, f_year_to, f_rating, f_count, announce=False):
     """
     Resolve the chosen mode to a query, rank, and render the first page.
 
@@ -1000,14 +1045,14 @@ def recommend(state, mode, game, author, user, systems, tags, v_authors,
     nobody asked.
     """
     blank = pd.DataFrame(columns=RESULT_COLUMNS)
+    per_page = DEFAULT_PAGE_SIZE
     empty_state = {"results": [], "scored": [], "relevance": {},
                    "query_key": None, "page": 0, "per_page": per_page}
-    per_page = _as_int(per_page, DEFAULT_PAGE_SIZE)
 
     def nothing(message):
         """Clear the page and say why — or say nothing, if nobody asked."""
         if not announce:
-            return (gr.skip(),) * 17
+            return (gr.skip(),) * 18
         return (_table_update(blank), "", "", empty_state, message, "",
                 *NO_PAGES, *NO_FILTERS)
 
@@ -1027,19 +1072,14 @@ def recommend(state, mode, game, author, user, systems, tags, v_authors,
                _as_float(f_rating, None), _as_int(f_count, None))
     if reused and state.get("results") and state.get("applied") == applied:
         logger.debug("echo of our own filter values — nothing to do")
-        return (gr.skip(),) * 17
+        return (gr.skip(),) * 18
 
     if not reused:
         f_author, f_system, f_language, f_topics = [], [], [], []
         f_year_from = f_year_to = None
 
-    # The year dropdowns offer this result set's own span, so "not narrowed"
-    # means its ends, not the corpus's. The span is carried in state because a
-    # filter change has to judge against the same bounds the user is seeing.
-    year_bounds = (state or {}).get("year_bounds") if reused else None
     hard_filters = _build_filters(f_author, f_system, f_language, f_topics,
-                                  f_year_from, f_year_to, f_rating, f_count,
-                                  year_bounds)
+                                  f_year_from, f_year_to, f_rating, f_count)
     exclude, cached, emb, query_text = set(), None, None, ""
     # game and author are item-space modes: their live fallback is a nearest-
     # neighbour lookup from these seeds (src/pipeline/items.py), never the
@@ -1115,24 +1155,11 @@ def recommend(state, mode, game, author, user, systems, tags, v_authors,
     if not scored:
         return nothing("Nothing above the retrieval threshold for that query.")
 
-    # A new query starts from the default thresholds like every other filter:
-    # carrying 4.5 into a pool topping out at 4.26 filtered away every result
-    # and left nothing on screen to relax it from. The defaults still need
-    # snapping — a pool whose games all have 19 ratings offers only the rung
-    # below that, so the default of 1 becomes 10 — and the rungs are settled
-    # before filtering, not after, so the controls and the results below them
-    # describe the same thing.
-    if reused:
-        rungs = (state or {}).get("ladders") or {}
-        rating_rungs = rungs.get("rating") or RATING_CHOICES
-        count_rungs = rungs.get("count") or RATING_COUNT_CHOICES
-    else:
-        rating_rungs, count_rungs = _rating_ladders(scored)
-        f_rating = _clamp_to(rating_rungs, FILTER_DEFAULTS[6])
-        f_count = _clamp_to(count_rungs, FILTER_DEFAULTS[7])
+    # A new query starts from the default thresholds like every other filter.
+    if not reused:
+        f_rating, f_count = FILTER_DEFAULTS[6], FILTER_DEFAULTS[7]
         hard_filters = _build_filters(f_author, f_system, f_language, f_topics,
-                                      f_year_from, f_year_to, f_rating, f_count,
-                                      year_bounds)
+                                      f_year_from, f_year_to, f_rating, f_count)
 
     targets = pipeline._parse_profile_targets(query_text) if mode != "vibe" else (set(), set())
     # Ask for every result the pool can yield, then paginate locally.
@@ -1148,24 +1175,17 @@ def recommend(state, mode, game, author, user, systems, tags, v_authors,
         stranded = {"results": [], "scored": scored, "relevance": relevance,
                     "query_key": query_key, "page": 0, "per_page": per_page,
                     "headline": note, "query_text": query_text,
-                    # The filter updates below are no-ops, so the choices on
-                    # screen are still the previous render's. Record those, not
-                    # the ones this run worked out, or the reset button will
-                    # offer a value the dropdown no longer lists.
-                    "year_bounds": (state or {}).get("year_bounds"),
-                    "ladders": (state or {}).get("ladders"),
                     "applied": applied,
                     "corpus_order": mode in ("game", "vibe")}
         return (_table_update(blank),
                 _summary(note, query_text, corpus_order=mode in ("game", "vibe")), "",
                 stranded, "No results match those filters — try relaxing them.", "",
                 *NO_PAGES, gr.update(visible=True),
-                *(gr.update() for _ in range(8)))
+                *(gr.update() for _ in range(9)))
 
     state = {"results": results, "scored": scored, "relevance": relevance,
              "query_key": query_key, "page": 0, "per_page": per_page,
              "headline": note, "query_text": query_text,
-             "year_bounds": year_bounds, "ladders": (state or {}).get("ladders"),
              "applied": applied,
              "corpus_order": mode in ("game", "vibe")}
     summary = _summary(note, query_text, corpus_order=mode in ("game", "vibe"))
@@ -1173,29 +1193,28 @@ def recommend(state, mode, game, author, user, systems, tags, v_authors,
     # On a new query, offer only what these results actually contain, and clear
     # the carried-over selections. On a filter change, leave both alone.
     if reused:
-        filter_updates = (gr.update(visible=True), *(gr.update() for _ in range(8)))
+        filter_updates = (gr.update(visible=True), *(gr.update() for _ in range(9)))
     else:
         choices = _choices_from_results(results)
-        low, high = state["year_bounds"] = _year_span(results)
-        years = list(range(high, low - 1, -1))
-        state["ladders"] = {"rating": rating_rungs, "count": count_rungs}
         # What the controls will hold once this response lands — the cleared
-        # categoricals, the offered span, the snapped thresholds. The echo
-        # events arrive carrying exactly this, which is how they are known.
-        state["applied"] = ([], [], [], [], low, high, f_rating, f_count)
+        # categoricals and the default thresholds. The echo events arrive
+        # carrying exactly this, which is how they are known.
+        state["applied"] = ([], [], [], [], YEAR_MIN, YEAR_MAX, f_rating, f_count)
         filter_updates = (
             # Collapsed again: a new query resets every control inside, so
             # leaving it open would show the reader a block that no longer says
             # anything about what they just searched for.
             gr.update(visible=True, open=False),
-            gr.update(choices=choices["author"], value=[]),
-            gr.update(choices=choices["system"], value=[]),
-            gr.update(choices=choices["language"], value=[]),
-            gr.update(choices=choices["genre_tags"], value=[]),
-            gr.update(choices=years, value=low),
-            gr.update(choices=years, value=high),
-            gr.update(choices=rating_rungs, value=f_rating),
-            gr.update(choices=count_rungs, value=f_count),
+            "", "", "", "",                              # the four pickers, cleared
+            gr.update(choices=YEAR_CHOICES, value=YEAR_MIN),
+            gr.update(choices=YEAR_CHOICES, value=YEAR_MAX),
+            gr.update(choices=RATING_CHOICES, value=f_rating),
+            gr.update(choices=RATING_COUNT_CHOICES, value=f_count),
+            # Their lists, from these results, for the pickers to search.
+            json.dumps({name: [[f"{v}  ·  {n}", v] for v, n in choices[field]]
+                        for name, field in (("f_author", "author"), ("f_system", "system"),
+                                            ("f_language", "language"), ("f_topics", "genre_tags"))},
+                       ensure_ascii=False),
         )
 
     return (_table_update(_page_table(results, relevance, 0, per_page)), summary,
@@ -1211,17 +1230,6 @@ def turn_page(state, step):
     pages = max(1, -(-len(state["results"]) // per_page))
     state = {**state, "per_page": per_page, "page": min(max(state["page"] + step, 0), pages - 1)}
     table = _page_table(state["results"], state["relevance"], state["page"], per_page)
-    return (_table_update(table), _summary_for(state), _count_for(state), state,
-            _pager_text(state), *_pager_buttons(state))
-
-
-def resize_page(state, per_page):
-    per_page = _as_int(per_page, DEFAULT_PAGE_SIZE)
-    if not state or not state["results"]:
-        return (_table_update(pd.DataFrame(columns=RESULT_COLUMNS)), "", "",
-            {**(state or {}), "per_page": per_page}, "", *NO_PAGES)
-    state = {**state, "per_page": per_page, "page": 0}
-    table = _page_table(state["results"], state["relevance"], 0, per_page)
     return (_table_update(table), _summary_for(state), _count_for(state), state,
             _pager_text(state), *_pager_buttons(state))
 
@@ -1245,18 +1253,13 @@ def _reset():
              "query_key": None, "page": 0, "per_page": DEFAULT_PAGE_SIZE}
     return [
         "game",                                          # mode
-        gr.update(value=None, visible=True),             # game
-        gr.update(value=None, visible=False),            # author
-        gr.update(value=None, visible=False),            # user
-        gr.update(value=[], visible=False),              # systems
-        gr.update(value=[], visible=False),              # tags
-        gr.update(value=[], visible=False),              # vibe authors
+        *_visibility("game"),                            # the pickers, per mode
+        *BLANK_PICKS,                                    # and their values
         *FILTER_DEFAULTS[:4],                            # author, system, language, genres/tags
         gr.update(choices=YEAR_CHOICES, value=YEAR_MIN),  # year ≥, back to the
         gr.update(choices=YEAR_CHOICES, value=YEAR_MAX),  # corpus span it loads with
         gr.update(choices=RATING_CHOICES, value=FILTER_DEFAULTS[6]),        # and the
         gr.update(choices=RATING_COUNT_CHOICES, value=FILTER_DEFAULTS[7]),  # full ladders
-        DEFAULT_PAGE_SIZE,                               # per_page
         _table_update(blank), "", "", fresh, "", "",     # results, summary, count, state, notice, pager
         *NO_PAGES,                                       # prev, next
         gr.update(visible=False, open=False),             # the filter block
@@ -1268,7 +1271,11 @@ def _visibility(mode):
             for m in ("game", "author", "reviewer", "vibe", "vibe", "vibe")]
 
 
-def _mode_changed(mode, per_page):
+# The six query pickers' hidden textboxes, cleared on reset.
+BLANK_PICKS = [""] * 6
+
+
+def _mode_changed(mode):
     """
     Switching mode starts a new search, so nothing from the last one survives.
 
@@ -1285,7 +1292,7 @@ def _mode_changed(mode, per_page):
     and choosing the game is plainly the next thing they were going to do.
     """
     fresh = {"results": [], "scored": [], "relevance": {}, "query_key": None,
-             "page": 0, "per_page": _as_int(per_page, DEFAULT_PAGE_SIZE)}
+             "page": 0, "per_page": DEFAULT_PAGE_SIZE}
     return [
         *_visibility(mode),
         *FILTER_DEFAULTS[:4],                                # the list filters
@@ -1308,37 +1315,31 @@ def build_ui():
         with gr.Group():
             gr.Markdown("search mode", elem_classes="block-header")
             mode = gr.Radio(MODES, value="game", show_label=False, interactive=True)
-            game = gr.Dropdown(GAME_CHOICES, value=None, label="game",
-                               info=BIG_HINT.format(n=round(len(GAME_CHOICES) / 1000)),
-                               filterable=True, visible=True)
-            author = gr.Dropdown(AUTHOR_CHOICES, value=None, label="author",
-                                 info=BIG_HINT.format(n=round(len(AUTHOR_CHOICES) / 1000)),
-                                 filterable=True, visible=False)
-            user = gr.Dropdown(USER_CHOICES, value=None, label="reviewer",
-                               info=BIG_HINT.format(n=round(len(USER_CHOICES) / 1000)),
-                               filterable=True, visible=False)
-            systems = gr.Dropdown(SYSTEM_CHOICES, value=[], label="systems", info=PICK_HINT,
-                                  multiselect=True, visible=False)
+            game_w, game = picker("game", "game", HINT.format(what="ratings"))
+            author_w, author = picker("author", "author", HINT.format(what="games"), visible=False)
+            user_w, user = picker("reviewer", "reviewer", HINT.format(what="reviews"), visible=False)
+            systems_w, systems = picker("systems", "systems", MULTI_HINT.format(what="games"),
+                                        multi=True, visible=False)
             # "genres/tags" here too, though this vocabulary is the cleaned one
             # the encoders saw: genre values are folded into it already, and
             # competition tags are stripped. The filter below offers the raw
             # values instead, so the two lists differ — but both cover the same
             # idea, and calling one "tags" made them look unrelated.
-            tags = gr.Dropdown(TAG_CHOICES, value=[], label="genres/tags", info=PICK_HINT,
-                               multiselect=True, visible=False)
+            tags_w, tags = picker("tags", "genres/tags", MULTI_HINT.format(what="games"),
+                                  multi=True, visible=False)
             # The one profile section a reviewer's history supplies that a vibe
             # can supply too and that earns a picker: authors is the strongest
             # taste signal the data has (see NOTES, "Which profile sections
             # matter"). Dislikes measured as doing nothing to the ranking, and
             # language is a constraint rather than a taste — for most readers
             # the hardest filter there is — so it lives with the filters.
-            v_authors = gr.Dropdown(VIBE_AUTHOR_CHOICES, value=[], label="authors you like",
-                                    info=BIG_HINT.format(n=round(len(VIBE_AUTHOR_CHOICES) / 1000)),
-                                    multiselect=True, filterable=True, visible=False)
+            v_authors_w, v_authors = picker("v_authors", "authors you like", MULTI_HINT.format(what="games"),
+                                            multi=True, visible=False)
+            pickers = [game_w, author_w, user_w, systems_w, tags_w, v_authors_w]
+            picks = [game, author, user, systems, tags, v_authors]
 
         with gr.Row(elem_id="action-row"):
-            per_page = gr.Dropdown(PAGE_SIZES, value=DEFAULT_PAGE_SIZE, label="results per page", scale=1)
-            go = gr.Button("recommend", variant="primary", scale=3)
+            go = gr.Button("recommend", variant="primary")
 
         note = gr.Markdown(elem_id="summary")
 
@@ -1351,11 +1352,13 @@ def build_ui():
         with gr.Accordion("result filters", open=False, visible=False,
                           elem_id="filters-block") as filters_block:
             with gr.Row(elem_id="filters-head"):
-                gr.Markdown(FREE_TEXT_HINT, elem_classes="filter-hint")
                 reset_filters = gr.Button("( reset )", size="sm", elem_id="reset-filters")
             # elem_classes rather than Gradio's own row class: the internal names
             # are not API and have changed between majors, whereas these are ours.
-            with gr.Row(elem_classes="control-row"):
+            # A nested row, so this row has the shape of the one below it — one
+            # child holding four blocks — and the same CSS sizes both. Gradio
+            # gives the dropdowns that wrapper itself; HTML blocks get none.
+            with gr.Row(elem_classes="control-row"), gr.Row(elem_classes="picker-row"):
                 # Every filter defaults to a no-op, so an untouched block filters
                 # nothing and each control can be returned to that state.
                 # allow_custom_value lets someone type a fragment and press
@@ -1367,24 +1370,16 @@ def build_ui():
                 # Multiselect throughout, and for the same reason each time:
                 # empty is how you say "any", and a single-select offers no way
                 # back to it once something is chosen.
-                f_author = gr.Dropdown([], value=FILTER_DEFAULTS[0], label="author",
-                                       multiselect=True,
-                                       filterable=True, allow_custom_value=True)
-                f_system = gr.Dropdown([], value=FILTER_DEFAULTS[1], label="system",
-                                       multiselect=True,
-                                       filterable=True, allow_custom_value=True)
-                f_language = gr.Dropdown([], value=FILTER_DEFAULTS[2], label="language",
-                                         multiselect=True,
-                                         filterable=True, allow_custom_value=True)
+                _, f_author = picker("f_author", "author", multi=True, custom=True)
+                _, f_system = picker("f_system", "system", multi=True, custom=True)
+                _, f_language = picker("f_language", "language", multi=True, custom=True)
                 # Genre and tags as one control. IFDB splits the same idea
                 # across both fields — "Fantasy" is a genre on one game and a
                 # tag on the next — and the matching has always pooled them, so
                 # two filters implied a distinction the data does not keep. The
                 # cards still show the fields apart, which is where the
                 # distinction does mean something.
-                f_topics = gr.Dropdown([], value=FILTER_DEFAULTS[3], label="genres/tags",
-                                       multiselect=True,
-                                       filterable=True, allow_custom_value=True)
+                _, f_topics = picker("f_topics", "genres/tags", multi=True, custom=True)
             with gr.Row(elem_classes="control-row"):
                 # Year before rating, again as the cards read. The choices are
                 # replaced per query with the span those results cover.
@@ -1405,6 +1400,11 @@ def build_ui():
                                        label="rating ≥", allow_custom_value=True)
                 f_count = gr.Dropdown(RATING_COUNT_CHOICES, value=FILTER_DEFAULTS[7],
                                       label="rating count ≥", allow_custom_value=True)
+
+        # The four filter pickers' lists change with every result set; they
+        # travel in this hidden textbox and are handed to the widgets client-side.
+        f_lists = gr.Textbox(value="", elem_classes="if-hidden", container=False, show_label=False)
+        f_lists.change(None, [f_lists], None, js="(v) => { IF.setLists(v ? JSON.parse(v) : {}); }")
 
         count = gr.Markdown(elem_id="result-count")
         # Messages live here rather than in the summary. Folding "no results
@@ -1429,25 +1429,23 @@ def build_ui():
         filter_controls = [f_author, f_system, f_language, f_topics,
                            f_year_from, f_year_to, f_rating, f_count]
         home.click(_reset, None,
-                   [mode, game, author, user, systems, tags, v_authors,
-                    *filter_controls,
-                    per_page, table, note, count, state, notice, pager, prev, nxt,
+                   [mode, *pickers, *picks, *filter_controls,
+                    table, note, count, state, notice, pager, prev, nxt,
                     filters_block]).then(
             None, None, None, js=SCROLL_TO_TOP).then(
             None, None, None, js=COLLAPSE_FILTERS)
 
-        mode.change(_mode_changed, [mode, per_page],
-                    [game, author, user, systems, tags, v_authors,
-                     *filter_controls,
+        mode.change(_mode_changed, mode,
+                    [*pickers, *filter_controls,
                      filters_block, table, note, count, state, notice, pager,
                      prev, nxt]).then(None, None, None, js=COLLAPSE_FILTERS)
         inputs = [state, mode, game, author, user, systems, tags, v_authors,
-                  *filter_controls, per_page]
+                  *filter_controls]
         # The dynamic filters ride along on every run so their choices can be
         # rebuilt when the query changes and left alone when it does not.
         results_out = [table, note, count, state, notice, pager, prev, nxt,
                        filters_block, f_author, f_system, f_language, f_topics,
-                       f_year_from, f_year_to, f_rating, f_count]
+                       f_year_from, f_year_to, f_rating, f_count, f_lists]
         def _recommend_clicked(*args):
             """The button may say "pick something first"; a filter move may not."""
             return recommend(*args, announce=True)
@@ -1473,27 +1471,16 @@ def build_ui():
 
         # Restoring the controls is programmatic, so it fires no handlers of its
         # own; the explicit re-run is what makes the results match them.
-        # Years reset to the ends of what this result set offers, since those
-        # are the values that mean "no year constraint" here; the corpus-wide
-        # defaults would sit outside the dropdowns' own choices.
-        def _reset_filters(state):
-            # Choices travel with every value. Sending a bare number relies on
-            # the dropdown already offering it, and when state and screen had
-            # drifted apart Gradio rejected the update outright — "2026 is not
-            # in the list of choices" — leaving the reader an error toast for a
-            # button that should always work. Sent together they cannot disagree.
-            low, high = (state or {}).get("year_bounds") or (YEAR_MIN, YEAR_MAX)
-            years = list(range(high, low - 1, -1))
-            rungs = (state or {}).get("ladders") or {}
-            rating = rungs.get("rating") or RATING_CHOICES
-            count = rungs.get("count") or RATING_COUNT_CHOICES
+        def _reset_filters():
+            # Choices travel with every value, so the control and the value
+            # sent to it cannot disagree.
             return (*FILTER_DEFAULTS[:4],
-                    gr.update(choices=years, value=low),
-                    gr.update(choices=years, value=high),
-                    gr.update(choices=rating, value=_clamp_to(rating, FILTER_DEFAULTS[6])),
-                    gr.update(choices=count, value=_clamp_to(count, FILTER_DEFAULTS[7])))
+                    gr.update(choices=YEAR_CHOICES, value=YEAR_MIN),
+                    gr.update(choices=YEAR_CHOICES, value=YEAR_MAX),
+                    gr.update(choices=RATING_CHOICES, value=FILTER_DEFAULTS[6]),
+                    gr.update(choices=RATING_COUNT_CHOICES, value=FILTER_DEFAULTS[7]))
 
-        reset_filters.click(_reset_filters, state, filter_controls).then(
+        reset_filters.click(_reset_filters, None, filter_controls).then(
             recommend, inputs, results_out)
         # Paging lands the reader back at the summary, not stranded at the
         # bottom of the previous page.
@@ -1501,11 +1488,14 @@ def build_ui():
             None, None, None, js=SCROLL_TO_SUMMARY)
         nxt.click(lambda s: turn_page(s, +1), state, [table, note, count, state, pager, prev, nxt]).then(
             None, None, None, js=SCROLL_TO_SUMMARY)
-        per_page.change(resize_page, [state, per_page], [table, note, count, state, pager, prev, nxt])
     return demo
 
 
 if __name__ == "__main__":
     # Gradio 6 takes theme and css at launch(), not on the Blocks constructor —
     # passing them to Blocks is accepted with a warning and then ignored.
-    build_ui().queue().launch(theme=gr.themes.Monochrome(), css=CSS)
+    demo = build_ui().queue()
+    app, _local, _share = demo.launch(theme=THEME, css=CSS + PICKER_CSS, head=HEAD,
+                                      prevent_thread_lock=True)
+    app.get(LISTS_ROUTE)(lists_route)
+    demo.block_thread()
