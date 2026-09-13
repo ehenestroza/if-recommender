@@ -13,9 +13,11 @@ from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 
+from src.data.columns import clean_col
 from src.data.preprocessor import (
     SYSTEM_GENRE_SEPARATORS,
     build_display_map,
+    clean_frequencies,
     profile_vocabulary,
 )
 
@@ -33,15 +35,18 @@ EXCLUDED_AUTHORS = {
 
 def game_choices(game_docs: pd.DataFrame) -> List[Tuple[str, str]]:
     """
-    Games as "Title — Author (Year)", most-reviewed first.
+    Games as "Title — Author (Year)  ·  N ratings", most-rated first.
 
     119 titles are shared by up to five different games, so a bare title would
     make all but one of each unreachable. Author and year disambiguate at no cost
-    to typing, and help even where titles are unique.
+    to typing, and help even where titles are unique. The rating count is the
+    sort key made visible, as the author and reviewer lists show theirs; the
+    two-space "  ·  " separator is what the web picker splits the note off on.
     """
     frame = game_docs.sort_values("review_count", ascending=False)
     return [
-        (f"{r.title} — {r.author}" + (f" ({r.year})" if str(r.year).strip() else ""), r.gameid)
+        (f"{r.title} — {r.author}" + (f" ({r.year})" if str(r.year).strip() else "")
+         + f"  ·  {int(r.review_count)} rating{'s' if int(r.review_count) != 1 else ''}", r.gameid)
         for r in frame.itertuples(index=False)
     ]
 
@@ -85,7 +90,11 @@ def vocab_choices(
     systems, tags = profile_vocabulary(game_docs, n_systems=n_systems, n_tags=n_tags)
     system_casing = build_display_map(game_docs, "system", SYSTEM_GENRE_SEPARATORS)
     tag_casing = build_display_map(game_docs, "tags")
+    # How many games carry each value — the sort key, shown as the other lists
+    # show theirs, after the "  ·  " the web picker splits the note off on.
+    system_count = clean_frequencies(game_docs, clean_col("system"))
+    tag_count = clean_frequencies(game_docs, clean_col("tags"))
     return (
-        [(system_casing.get(s, (s, 0))[0], s) for s in systems],
-        [(tag_casing.get(t, (t, 0))[0], t) for t in tags],
+        [(f"{system_casing.get(s, (s, 0))[0]}  ·  {system_count[s]}", s) for s in systems],
+        [(f"{tag_casing.get(t, (t, 0))[0]}  ·  {tag_count[t]}", t) for t in tags],
     )

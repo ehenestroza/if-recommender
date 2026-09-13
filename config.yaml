@@ -105,6 +105,11 @@ retrieval:
   use_diversity: true         # post-rerank step to cover all target genres/systems
   # Item modes (game, author): nearest neighbours in the item encoder's space.
   # Floor on rescaled relevance (cosine above the random-pair baseline, see
-  # items.py). 0.30 leaves a median of ~1,000 candidates, rarely fewer than 50.
-  min_item_score: 0.30
+  # items.py). Calibrated on the 200 most-reviewed games, not a random sample:
+  # a famous game's neighbourhood is diffuse (raters from every era), so at
+  # 0.30 a quarter of them stored fewer than 50 results — Galatea 18, Lost Pig
+  # 21 — while an obscure game in a tight cohort cleared a thousand. 0.20 gives
+  # the famous ones a median of 330 and none under 50; the tail is capped by
+  # precompute's top-n anyway.
+  min_item_score: 0.20
   author_merge: "centroid"    # "centroid" of the author's games, or "max" over them

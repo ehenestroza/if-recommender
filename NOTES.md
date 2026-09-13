@@ -184,6 +184,18 @@ Both helpers read the `_clean` columns, so the values a UI offers are exactly th
 
 **The author cap works on the whole ranking, not a page.** `diversify_results` sets aside an author's third and later games; they now go to the tail of the list in score order, so a short page still fills from them but they never outrank another author's first. They used to be merged back by score whenever the cap left fewer than `top_k` — and the web app asks for the whole pool and paginates itself, so `top_k` was the pool size, the page was always "short", and the cap had been doing nothing there since local pagination arrived. It surfaced once the `Authors` section made same-author concentration common: four games by one author in a reviewer's top five.
 
+**The big pickers are search boxes, and they run in the browser.** A dropdown of ten thousand games shipped every option to the browser, rendered them all on first open — a second-long stall — and then asked the reader to scroll a list nobody can scroll; and Gradio's own filter is a substring match that cannot be changed. Every picker with more than a few dozen options (game, author, reviewer, the vibe systems, tags and authors, and the four list filters) is now a widget of our own (`assets/picker.js`), modelled on the answers search at spreadthewordlist: type, and the ten commonest entries *starting* with what you typed appear with the prefix in bold — "pl" gives Planetfall and Plundered Hearts, not everything with "pl" in it — arrows and Enter choose, Escape and a click elsewhere close, and an empty box shows the ten commonest on focus, so a list can be browsed as well as searched. Each picker carries its hint under its label — "type to search · most ratings first", "… most reviews first", and for the vibe pickers "… · choose one or more". The "results per page" control went for the same reason the hint text under the filters did: space without value. Pages are twenty.
+
+**One layout at every width.** The app is capped at 768px — what used to be the phone band is the only band: one column of result cards, two columns of filters, a full-width button. Wider screens only ever stretched search boxes and buttons into something unwieldy, two columns of cards read oddly, and a picker that was a third of the page at 900px and the whole page at 700px jumped at the breakpoint. The side gutters are fixed rather than viewport-relative for the same reason: a field should be the same size on every screen wide enough to hold it.
+
+Every entry carries its count, as a bare number dimmed beside the name — ratings for a game, games for an author, reviews for a reviewer, and for a filter how many of the current results carry the value; the hint above each box says which ("most reviews first"), so the word is not repeated ten times down the list, and the chips carry only the name. Multi-select shows chips; Backspace on an empty box removes the last one; the filters also take a typed fragment on Enter, as before.
+
+Nothing leaves the browser until "recommend". A first version refreshed the list from the server on every keystroke (Gradio's `key_up` event), which worked but put typing at the mercy of a round-trip to a VM that shares one CPU with vibe scoring — exactly the latency the original client-side rule was meant to avoid. The lists come from one gzipped route on the app (`/if/lists.json`, 0.6 MB for 31k entries), fetched once per page load and revalidated by ETag, so a data refresh reaches a returning visitor without a cache expiry. Gradio does not gzip, so inlining them would have cost 1.6 MB a load.
+
+Each widget mirrors its value into a hidden textbox — an id, or a JSON array for multi-select — which is what `recommend` reads; Python clears it the same way, through a client-side `change` handler on that textbox, so a reset or a mode switch clears the widget too, and a widget re-mounted after being hidden reads its value back. The filters' lists change with every result set and travel in a hidden textbox of their own.
+
+Type follows [spreadthewordlist](https://spreadthewordlist.pages.dev), minus its lavender: Poppins at 14px and weight 300, 500 for anything that needs weight, 13px in fields and buttons, flat borderless fields, 8px blocks and 6px controls. It is set on the theme wherever a variable exists so dark mode keeps its own values rather than inheriting a light-mode hex.
+
 Filters narrow a ranking you are already looking at. They run after scoring, so they never change which candidates were ranked — the scores you see are identical filtered or not.
 
 | Key | Matches |
@@ -193,12 +205,13 @@ Filters narrow a ranking you are already looking at. They run after scoring, so 
 | `rating` | raw community average; unrated games excluded |
 | `count` | number of ratings |
 
-Every filter offers only what the results in front of you contain: the list
-fields are ordered by frequency, the year dropdowns span that set's own range
-(continuously, gaps filled), and the two rating ladders are trimmed to the rungs
-that change something — a rung above everything observed returns nothing, and a
-rung below the lowest returns what the next one up already returns. Counts of
-2, 3, 8, 10, 12 leave `[2, 5, 10]` out of `[0, 1, 2, 5, 10, 25, 50]`.
+The four list filters offer only what the results in front of you contain,
+ordered by how many of those results carry each value, with that count shown.
+The year and rating controls always offer the corpus's full span and full
+ladders. They used to be trimmed to the result set — years to its own range,
+ratings to the rungs that changed something — and it read as the dataset
+stopping at 2022 rather than the results; a reader wondering why 2024 was not
+on offer is worse than a rung that returns nothing and says so.
 
 IFDB records "no authoring system" as the literal string `None` (164 games) and
 once as `N/A`. Both are blanked at load time, in the original and `_clean`
@@ -209,6 +222,8 @@ missing field shows an em dash. The `N/A` was worse than it looked: the display
 map splits on `/`, so it had also been producing systems called "N" and "A". The
 games themselves stay; only the field is emptied. `Other` and `Misc` in the
 genre and tag lists are left alone — vague, but real values people applied.
+
+The query panel prints the profile with every section labelled — `systems: twine, ink // authors: Pseudavid // tags: multiple endings, … // dislikes: ghost` — authors ahead of tags because there are fewer of them, dislikes last. It used to leave systems and tags unlabelled and label only the later sections, which read as two different things.
 
 Messages — "pick a game first", "no results match those filters" — render in
 their own slab below the filters rather than in the profile block. Folding the
@@ -231,17 +246,8 @@ the block's choices were built from the previous mode's results and its values
 were applied to them, so both describe something the reader has just navigated
 away from.
 
-Two traps live in that, both of which cost results silently rather than
-visibly. **The rating ladders are derived from the scored pool, not from the
-results on screen.** The results on screen have always had the rating filter
-applied to them, so rungs read back off them would start at the 3.0 default —
-the filter could only ever be tightened, and the tail below it would be
-unreachable. The pool is that same set before the two thresholds touched it.
-Defaults are snapped into the rungs *before* filtering rather than after, since
-a pool whose games all hold 19 ratings offers only the rung below that. **And a
-year span counts as "no constraint" only against the span being offered**, not
-the corpus one, because applying a range drops the 184 games with no recorded
-year.
+One trap remains: **the full year span counts as "no constraint"**, and must,
+because applying a range drops the 184 games with no recorded year.
 
 Genre and tags are one filter, `genres/tags`, matching either field. The
 matching has always pooled them — the `_clean` tag column folds genre in, which
@@ -388,7 +394,7 @@ The data invites it: reviewers rate whole competition cohorts, so co-liked games
 
 Photopia still gets *9:05*, *Shade*, *I-0*, *Aisle*, *Galatea* and *Varicella* — its actual contemporaries in taste — while Counterfeit Monkey's neighbours now run from *Savoir-Faire* (2002) to *Never Gives Up Her Dead* (2023). Validation item Recall@10 went *up*, 0.072 to 0.076, on a metric that rewards same-cohort matches.
 
-**Relevance is rescaled cosine.** The space is narrow — random pairs sit at cosine 0.75 and a game's 500th neighbour well above 0.8 — so raw values would read as "everything matches" and a cosine floor would never bite. Relevance is `(cos − baseline) / (1 − baseline)`, clipped to [0, 1], with the baseline — 0.751 for the shipped encoder — measured over random pairs when the index is built. Affine and corpus-wide, so it stays absolute: a first neighbour lands around 0.8, the 500th around 0.4, and a seed with only weak neighbours still looks weak. `min_item_score: 0.30` on that scale leaves a median of ~1,000 candidates, and rarely fewer than 50.
+**Relevance is rescaled cosine.** The space is narrow — random pairs sit at cosine 0.75 and a game's 500th neighbour well above 0.8 — so raw values would read as "everything matches" and a cosine floor would never bite. Relevance is `(cos − baseline) / (1 − baseline)`, clipped to [0, 1], with the baseline — 0.751 for the shipped encoder — measured over random pairs when the index is built. Affine and corpus-wide, so it stays absolute: a first neighbour lands around 0.8, the 500th around 0.4, and a seed with only weak neighbours still looks weak. `min_item_score` is 0.20 on that scale — calibrated on the 200 most-reviewed games rather than a random sample. The distinction matters: a famous game's neighbourhood is diffuse, its raters spanning every era, so at 0.30 a quarter of the most-reviewed games stored fewer than 50 results (Galatea 18, Counterfeit Monkey 20, Lost Pig 21) while a random game, typically one competition cohort, cleared a thousand. At 0.20 the famous ones get a median of 330 and none fall under 50; the tail is capped by precompute's top-n anyway.
 
 The neighbours read as a person's would. Photopia's are *9:05*, *I-0*, *Shade*, *Galatea*, *Violet* and *For a Change*; Counterfeit Monkey's are *Hadean Lands*, *City of Secrets* and *Savoir-Faire*. The tag route had given Photopia *BYOD [es]*, *Broken* and *A Normal Lost Phone* — games that share its tags and nothing else.
 

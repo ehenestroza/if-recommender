@@ -92,7 +92,7 @@ Everything tunable lives in `config.yaml`. The settings worth knowing:
 |---|---|---|
 | `min_retrieval_score` | 0.15 | How similar a game must be to make the shortlist |
 | `min_rerank_score` | 0.10 | Relevance floor for what gets stored and shown (reviewer, vibe) |
-| `min_item_score` | 0.30 | The same floor for game and author results |
+| `min_item_score` | 0.20 | The same floor for game and author results |
 | `author_merge` | `"centroid"` | How an author's games become one query; `"max"` scores by the nearest of them |
 | `rerank_pool_cap` | 500 | Most candidates scored live, per `vibe` query |
 | `rating_weight` | 0.5 | How much rating counts toward *selecting* candidates — never toward their displayed order |
